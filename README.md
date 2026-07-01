@@ -19,17 +19,19 @@ Run over stock MORK on the AGM-blowup triangle `(e $x $y) (e $y $z) (e $x $z)` o
 of `s` in-edges and `s` out-edges (plus three ground triangles):
 
 ```
-    s | ProductZipper us | leapfrog us | speedup
-  256 |            9,705 |         651 |    14.9x
- 1024 |          152,441 |       2,585 |    59.0x
- 2048 |          619,647 |       5,223 |   118.6x
- 4096 |        2,471,936 |      10,047 |   246.0x
+    s  ans | PZ transitions       PZ us | leapfrog us | PZ/leapfrog   PZ us/s^2
+  128    3 |         99654        3040 |         360 |      8.4x        0.19
+  256    3 |        395846        9644 |         688 |     14.0x        0.15
+  512    3 |       1578054       39574 |        1335 |     29.6x        0.15
+ 1024    3 |       6301766      155005 |        2661 |     58.3x        0.15
+ 2048    3 |      25186374      623919 |        5299 |    117.7x        0.15
+ 4096    3 |     100704326     2482307 |       10528 |    235.8x        0.15
 ```
 
-The ProductZipper is Θ(s²): its microseconds over s² stay flat (0.15) as s grows. The leapfrog is
-O(s) on this instance: its microseconds double when s doubles. So the speedup grows with s and is
-246× at s = 4096. Both return the same three triangles. The leapfrog column is the whole sound
-path, the routability check plus the join, not the join alone.
+The ProductZipper is Θ(s²): its transitions grow as s² and its microseconds over s² stay flat at
+0.15 as s grows. The leapfrog is O(s) on this instance: its microseconds double when s doubles. So
+the speedup grows with s, to 236× at s = 4096. Both return the same three triangles. The leapfrog
+column times the whole sound path, the routability check and the join together.
 
 ## Byte-identical to MORK
 
