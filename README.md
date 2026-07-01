@@ -7,9 +7,11 @@ before pruning them down to the few real triangles. This adds a variable-at-a-ti
 each shared variable, so it never materializes those intermediates. Behind a sound router it
 returns exactly MORK's answers, and on the triangle it runs in O(s).
 
-The join carries unification, not equality alone: a variable in a stored fact is a wildcard that
-binds through a trail, so coreference in the data is respected. This is the trie-join integrated
-with unification, run over MORK's live PathMap with no copy of the data.
+The join carries unification, not equality alone. A variable in a stored fact is a wildcard, and it
+can bind a query subterm, so the join does data-side capture: given a query `(r (a $p) b)` and a
+fact `(r $d b)`, the stored `$d` absorbs the whole compound `(a $p)`. That is the step that makes
+this unification and not a relational join, and it is the case MORK's own matcher handles that a
+plain leapfrog does not. Everything runs over MORK's live PathMap, with no copy of the data.
 
 ## The result
 
@@ -18,28 +20,58 @@ of `s` in-edges and `s` out-edges (plus three ground triangles):
 
 ```
     s | ProductZipper us | leapfrog us | speedup
-  256 |           10,147 |         571 |    17.8x
- 1024 |          155,215 |       2,257 |    68.8x
- 2048 |          625,308 |       4,519 |   137.5x
- 4096 |        2,483,368 |       8,932 |   278.0x
+  256 |            9,705 |         651 |    14.9x
+ 1024 |          152,441 |       2,585 |    59.0x
+ 2048 |          619,647 |       5,223 |   118.6x
+ 4096 |        2,471,936 |      10,047 |   246.0x
 ```
 
-The ProductZipper is Θ(s²) (its microseconds over s² stay flat as s grows); the leapfrog is O(s)
-here (its microseconds double when s doubles). So the speedup grows with s and is 278× at
-s = 4096. Both return the same three triangles.
+The ProductZipper is Θ(s²): its microseconds over s² stay flat (0.15) as s grows. The leapfrog is
+O(s) on this instance: its microseconds double when s doubles. So the speedup grows with s and is
+246× at s = 4096. Both return the same three triangles. The leapfrog column is the whole sound
+path, the routability check plus the join, not the join alone.
 
 ## It equals MORK's answers
 
-The join is not a different semantics. A router sends a body to the leapfrog only when the two are
-provably byte-identical, and falls back to the ProductZipper otherwise, so the answers always match
-MORK. `run.sh` checks this on a capture-heavy corpus and on 4000 random flat-conjunctive queries:
+The join is not a different semantics. A router sends a body to the leapfrog only when the join is
+provably byte-identical to the ProductZipper, and falls back otherwise, so the answers always match
+MORK. `run.sh` checks this two ways.
+
+A capture + compound corpus, each case run through both and compared:
 
 ```
-4000 random trials: 660 leapfrog, 3340 fallback, 283 non-empty, 0 mismatches
+[match] capture query constant                        (via leapfrog)
+[match] witness: data var captures query compound (a $p) (via leapfrog)
+[match] cyclic compound capture                       (via leapfrog)
+[match] occurs-check compound (must be empty)         (via leapfrog)
+[match] join-propagated capture (declines, sound)     (via fallback)
+[match] ground + wildcard fact                        (via leapfrog)
+[match] coreferent data fact (free-var answer)        (via fallback)
+[match] ground triangle                               (via leapfrog)
 ```
 
-The corpus includes data-side capture cases; those fall back, and upstream MORK answers them
-correctly on its own (it does data-side capture). This join agrees with MORK; it does not fix it.
+And 4000 random flat-conjunctive queries, a class the join covers whole:
+
+```
+4000 random trials: 3894 leapfrog, 106 fallback, 283 non-empty, 0 mismatches
+```
+
+## Data-side capture of a compound
+
+The corpus witness is the case that separates unification from a relational join. The query
+`(, (r (a $p) b) (r (b) $p))` over facts `(r $d b), (r a b)` has answer `(ans b)`: `(r (b) $p)`
+binds `$p = b` through the data variable `$d` capturing `(b)`, then `(r (a $p) b)` with `$p = b` is
+`(r (a b) b)`, which the same `$d` captures as `(a b)`. A relational join, where query variables
+bind fact subterms but not the reverse, returns nothing here. The leapfrog captures the compound,
+and matches the ProductZipper and SWI-Prolog under occurs-check.
+
+The join covers the flat conjunctive queries whole, and the compound-capture shapes the matcher
+handles: a data variable capturing a query compound, cyclic capture, nested coreference, and the
+occurs-check (which correctly returns nothing). It declines one shape, where a single data variable
+both captures a non-ground compound and propagates that capture through the join
+(`(e (k $x0) $x1) (e (k $x1) $x2) (h $x2 $x0)`). Forcing it there produces one answer the
+ProductZipper does not, so the router keeps that shape on the ProductZipper. The gate is in the
+join module, self-contained, so a body that would diverge is never routed.
 
 ## How to run
 
@@ -54,28 +86,27 @@ aes and sse2).
 
 ## How the router stays sound
 
-The leapfrog is worst-case-optimal but not complete on every body. Two shapes diverge from the
-ProductZipper, and the random differential above is what surfaced them:
+`unify_join_zipper_body_safe` decides routing from the encoded body and the live map alone. A flat
+query routes whenever its answers are ground. A query with a compound argument routes when the
+matcher and the join agree, which is every compound shape except the propagated-capture one above;
+that check reads the query factors and the schematic facts under each join prefix and declines the
+divergent shape. The random differential is what surfaced the boundary: an earlier all-variable
+gate missed two flat shapes (a ground factor never checked to exist, and a data variable in a
+leading position that should capture a query constant), both since folded into the routed class and
+covered by the 4000-trial sweep.
 
-- A fully-ground factor like `(e b c)` folds to a prefix with no join column, so the join never
-  checks it exists and can report a spurious answer.
-- A data variable in a leading position, `(e $v b a)` under a query `(e b b $z)`, is skipped: the
-  join descends the literal bytes `e b b` and never reaches the fact whose first argument is the
-  variable that should capture `b`.
+Free-variable answers fall back too. The join computes them, but this standalone demo renders ground
+answers and leaves the fresh-variable emit to MORK, so a body whose answer carries a free variable
+routes to the ProductZipper here.
 
-So the router routes to the leapfrog only when every argument of every factor is a variable and
-every answer component comes out ground. That class has no ground prefix to miss a capture and no
-unchecked factor, and it is exactly where the two joins agree. Everything else, including data-side
-capture of a compound, falls back to the ProductZipper.
+## What the speedup is, and is not
 
-## Scope, honestly
-
-The leapfrog covers all-variable-column conjunctive joins, which is where worst-case-optimality
-matters (multi-way joins like the triangle). Single-factor queries, ground columns, and
-free-variable answers fall back; they are correct but not accelerated. A single join that is
-simultaneously worst-case-optimal and does data-side capture of a compound is not here yet, and the
-leapfrog declines compounds today. The router is a standalone demonstration; wiring it into MORK's
-exec dispatch so `metta_calculus` uses it is the next step.
+The win is on join-bound conjunctive queries, where the ProductZipper materializes an intermediate
+the worst-case-optimal join prunes. The triangle is that case. It is not a claim about MeTTa program
+speed in general: the exec/meta-rewrite loop is bound by how many times it re-derives an
+accumulating space, not by a per-query join intermediate, so a different lever (semi-naive delta)
+governs there. Wiring this join into `metta_calculus`'s dispatch so a conjunctive body uses it is
+the next step; the router here is a standalone demonstration of the join and its boundary.
 
 ## Provenance
 
@@ -89,6 +120,6 @@ exec dispatch so `metta_calculus` uses it is the next step.
 
 `proofs/` holds the Isabelle theories behind the design (Isabelle2025). `ZipperUnifySafe.thy`
 proves the trail/union-find the join threads is sound. `RoutingSafe.thy` proves that on flat data a
-union-find agreement equals first-order unification, and that on non-flat data it does not, which
-is the reason a compound falls back rather than routing. The specific gate this router uses and the
-two divergent shapes above are checked empirically by the differential, not by these theories.
+union-find agreement equals first-order unification, and that on non-flat data it does not, which is
+why a compound is checked against the matcher before routing rather than assumed safe. The specific
+gate and the one divergent shape are checked empirically by the differential, not by these theories.

@@ -12,7 +12,7 @@
 //!   RUSTFLAGS="-C target-cpu=native" cargo +nightly run -p mork --release --example wco_leapfrog
 
 use mork::space::Space;
-use mork::zipper_join::{parse_body_factors, unify_join_zipper_partial};
+use mork::zipper_join::unify_join_zipper_body_safe;
 use mork_expr::serialize;
 use pathmap::zipper::{ZipperIteration, ZipperMoving};
 use std::collections::BTreeSet;
@@ -99,66 +99,23 @@ fn mork_productzipper(facts: &str, patterns: &[&str], ans: &[String]) -> (BTreeS
     (out, transitions, us)
 }
 
-/// Whether every argument of every factor is a single variable (no ground column, no compound).
-/// This is the leapfrog's provably-sound class: with no ground argument there is no literal byte
-/// prefix that could skip a data variable which should capture it, and every factor carries a
-/// column so it is actually checked. A ground column or a leading constant routes to the ProductZipper.
-fn all_variable_columns(patterns: &[&str]) -> bool {
-    for p in patterns {
-        let s = p.trim();
-        if !s.starts_with('(') || !s.ends_with(')') {
-            return false;
-        }
-        let (mut depth, mut toks, mut cur) = (0i32, Vec::new(), String::new());
-        for ch in s[1..s.len() - 1].chars() {
-            match ch {
-                '(' => {
-                    depth += 1;
-                    cur.push(ch);
-                }
-                ')' => {
-                    depth -= 1;
-                    cur.push(ch);
-                }
-                c if c.is_whitespace() && depth == 0 => {
-                    if !cur.is_empty() {
-                        toks.push(std::mem::take(&mut cur));
-                    }
-                }
-                c => cur.push(c),
-            }
-        }
-        if !cur.is_empty() {
-            toks.push(cur);
-        }
-        if toks.len() < 2 || toks[1..].iter().any(|a| !a.starts_with('$')) {
-            return false;
-        }
-    }
-    true
-}
-
-/// The sound router: the WCO leapfrog when every factor is all variable columns and every answer
-/// row is fully ground (the class it is byte-identical to the ProductZipper on), else the
-/// ProductZipper. Returns the answers, which path ran, and the join microseconds.
+/// The sound router: the WCO leapfrog when the join owns the body as byte-identical to the
+/// ProductZipper and every answer row is fully ground, else the ProductZipper. The self-contained
+/// `unify_join_zipper_body_safe` makes that call, returning the ground answer rows when the body is
+/// routable and `None` otherwise. Routable covers every flat conjunctive query and the
+/// compound-capture shapes the join handles, including a data variable that captures a query
+/// compound. It declines the one compound shape that would diverge (a capture that both binds a
+/// compound and propagates it through the join) and any free-variable answer row, which this demo
+/// leaves to MORK's emit. Returns the answers, which path ran, and the join microseconds.
 fn router(facts: &str, patterns: &[&str], ans: &[String]) -> (BTreeSet<String>, &'static str, u128) {
-    if all_variable_columns(patterns) {
-        let body = encode_body(patterns);
-        if let Some((factors, nvars)) = parse_body_factors(&body) {
-            let mut space = Space::new();
-            space.add_all_sexpr(facts.as_bytes()).unwrap();
-            let order: Vec<usize> = (0..nvars).collect();
-            let t0 = std::time::Instant::now();
-            let rows = unify_join_zipper_partial(&space.btm, &factors, &order, nvars);
-            if rows.iter().all(|r| r.iter().all(|c| c.is_some())) {
-                let us = t0.elapsed().as_micros();
-                let out = rows
-                    .iter()
-                    .map(|r| ans_string(&r.iter().map(|c| c.clone().unwrap()).collect::<Vec<_>>()))
-                    .collect();
-                return (out, "leapfrog", us);
-            }
-        }
+    let body = encode_body(patterns);
+    let mut space = Space::new();
+    space.add_all_sexpr(facts.as_bytes()).unwrap();
+    let t0 = std::time::Instant::now();
+    if let Some(rows) = unify_join_zipper_body_safe(&space.btm, &body) {
+        let us = t0.elapsed().as_micros();
+        let out = rows.iter().map(|r| ans_string(r)).collect();
+        return (out, "leapfrog", us);
     }
     let (pz, _, us) = mork_productzipper(facts, patterns, ans);
     (pz, "fallback", us)
@@ -189,8 +146,9 @@ impl Rng {
 }
 
 /// A random flat conjunctive query and fact set: relations over variable/constant columns, facts
-/// that may carry data variables (schematic). No compounds, so this is the leapfrog's routable
-/// class; a constant column still makes the body fall back, exercising both paths.
+/// that may carry data variables (schematic). No compounds, so the whole body is the leapfrog's
+/// routable class, including the constant columns and the data-variable facts that capture them;
+/// only a free-variable answer row falls back to MORK's emit.
 fn gen_case(rng: &mut Rng) -> (String, Vec<String>) {
     let rels = ["e", "p", "q", "r"];
     let vars = ["$x", "$y", "$z"];
@@ -240,13 +198,15 @@ fn gen_case(rng: &mut Rng) -> (String, Vec<String>) {
 fn main() {
     let mut bad = 0;
 
-    println!("=== 1. Correctness: router vs MORK ProductZipper on a capture-heavy corpus ===\n");
+    println!("=== 1. Correctness: router vs MORK ProductZipper on a capture + compound corpus ===\n");
     let corpus: &[(&str, &str, &[&str])] = &[
         ("capture query constant", "(rel a $w)\n", &["(rel $x b)"]),
-        ("witness: p fixed by join", "(r $d b)\n(r a b)\n", &["(r (a $p) b)", "(r (b) $p)"]),
+        ("witness: data var captures query compound (a $p)", "(r $d b)\n(r a b)\n", &["(r (a $p) b)", "(r (b) $p)"]),
+        ("cyclic compound capture", "(r $d v0)\n(s v0 v1)\n(t v1 b)\n(r (a v0) junk)\n", &["(r (a $x) $y)", "(s $y $z)", "(t $z $x)"]),
+        ("occurs-check compound (must be empty)", "(e $w $w)\n(e v0 (f v1))\n", &["(e $x (f $x))"]),
+        ("join-propagated capture (declines, sound)", "(e (k $s2) v0)\n(e $s1 $s1)\n(h $s0 $s0)\n(h junk junk)\n", &["(e (k $x0) $x1)", "(e (k $x1) $x2)", "(h $x2 $x0)"]),
         ("ground + wildcard fact", "(p a)\n(p b)\n(q a)\n(q $w)\n", &["(p $x)", "(q $x)"]),
         ("coreferent data fact (free-var answer)", "(e $u $u)\n(e a b)\n(e b c)\n", &["(e $x $y)", "(e $y $z)"]),
-        ("occurs (must be empty)", "(e $w $w)\n", &["(e $x (f $x))"]),
         ("ground triangle", "(e a b)\n(e a c)\n(e b c)\n(e b d)\n", &["(e $x $y)", "(e $y $z)", "(e $x $z)"]),
     ];
     for (name, facts, patterns) in corpus {
@@ -289,7 +249,7 @@ fn main() {
     println!("\n=== 3. Optimality: router (leapfrog) vs ProductZipper on the AGM-blowup triangle ===\n");
     let tri = &["(e $x $y)", "(e $y $z)", "(e $x $z)"];
     let tri_ans = ans_vars_of(tri);
-    println!("{:>5} {:>4} | {:>13} {:>11} | {:>11} | {:>9} {:>11}", "s", "ans", "PZ transitions", "PZ us", "router us", "PZ/router", "PZ us/s^2");
+    println!("{:>5} {:>4} | {:>13} {:>11} | {:>11} | {:>9} {:>11}", "s", "ans", "PZ transitions", "PZ us", "leapfrog us", "PZ/leapfrog", "PZ us/s^2");
     for &s in &[128usize, 256, 512, 1024, 2048, 4096] {
         let facts = triangle_space(s);
         let (pz, pz_trans, pz_us) = mork_productzipper(&facts, tri, &tri_ans);
