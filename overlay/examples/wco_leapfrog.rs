@@ -164,6 +164,30 @@ impl Rng {
     }
 }
 
+/// A random atom `(rel a0 a1 ..)`: arity 2 or 3, each argument drawn from `special` one time in
+/// `special_den`, otherwise from `common`. The rng call order matches the inline builders it
+/// replaces, so the generated corpus is unchanged.
+fn random_atom(
+    rng: &mut Rng,
+    rels: &[&str],
+    special: &[&str],
+    special_den: usize,
+    common: &[&str],
+) -> String {
+    let rel = rels[rng.below(rels.len())];
+    let arity = 2 + rng.below(2);
+    let args: Vec<String> = (0..arity)
+        .map(|_| {
+            if rng.below(special_den) == 0 {
+                special[rng.below(special.len())].to_string()
+            } else {
+                common[rng.below(common.len())].to_string()
+            }
+        })
+        .collect();
+    format!("({} {})", rel, args.join(" "))
+}
+
 /// A random flat conjunctive query and fact set: relations over variable/constant columns, facts
 /// that may carry data variables (schematic). No compounds, so the whole body is the leapfrog's
 /// routable class: the constant columns, the data-variable facts that capture them, and the
@@ -176,19 +200,9 @@ fn gen_case(rng: &mut Rng) -> (String, Vec<String>) {
     loop {
         let npat = 1 + rng.below(3);
         let mut patterns = Vec::new();
+        // A pattern column is a query variable, or a constant one time in three.
         for _ in 0..npat {
-            let rel = rels[rng.below(rels.len())];
-            let arity = 2 + rng.below(2);
-            let args: Vec<String> = (0..arity)
-                .map(|_| {
-                    if rng.below(3) == 0 {
-                        consts[rng.below(consts.len())].to_string()
-                    } else {
-                        vars[rng.below(vars.len())].to_string()
-                    }
-                })
-                .collect();
-            patterns.push(format!("({} {})", rel, args.join(" ")));
+            patterns.push(random_atom(rng, &rels, &consts, 3, &vars));
         }
         let pats: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
         if ans_vars_of(&pats).is_empty() {
@@ -196,19 +210,10 @@ fn gen_case(rng: &mut Rng) -> (String, Vec<String>) {
         }
         let nfacts = rng.below(8);
         let mut facts = String::new();
+        // A fact column is a constant, or a data variable one time in four (a schematic fact).
         for _ in 0..nfacts {
-            let rel = rels[rng.below(rels.len())];
-            let arity = 2 + rng.below(2);
-            let args: Vec<String> = (0..arity)
-                .map(|_| {
-                    if rng.below(4) == 0 {
-                        dvars[rng.below(dvars.len())].to_string()
-                    } else {
-                        consts[rng.below(consts.len())].to_string()
-                    }
-                })
-                .collect();
-            facts.push_str(&format!("({} {})\n", rel, args.join(" ")));
+            facts.push_str(&random_atom(rng, &rels, &dvars, 4, &consts));
+            facts.push('\n');
         }
         return (facts, patterns);
     }
