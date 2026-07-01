@@ -21,6 +21,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 const TOP2: u8 = 0b1100_0000;
 const TAG_ARITY: u8 = 0b0000_0000;
 const TAG_VARREF: u8 = 0b1000_0000;
+#[cfg(test)]
 const TAG_SYMSIZE: u8 = 0b1100_0000;
 const NEWVAR_BYTE: u8 = 0b1100_0000;
 const LOW6: u8 = 0b0011_1111;
@@ -609,6 +610,7 @@ impl Env {
     }
 
     /// The ground value a query variable resolved to, or `None` if it is still free or schematic.
+    #[cfg(test)]
     fn ground_of(&self, id: usize) -> Option<Vec<u8>> {
         self.term_bytes_of(id)
             .filter(|bytes| first_subterm_is_ground(bytes))
