@@ -46,14 +46,17 @@ A capture + compound corpus, each case run through both and compared:
 [match] occurs-check compound (must be empty)         (via leapfrog)
 [match] join-propagated capture (declines, sound)     (via fallback)
 [match] ground + wildcard fact                        (via leapfrog)
-[match] coreferent data fact (free-var answer)        (via fallback)
+[match] coreferent data fact (free-var answer)        (via leapfrog-free)
 [match] ground triangle                               (via leapfrog)
 ```
 
-And 4000 random flat-conjunctive queries, a class the join covers whole:
+The `leapfrog-free` case has a free variable in the answer, and the two positions bound by the
+schematic fact `(e $u $u)` come out as one coordinated variable, exactly as MORK emits it. And 4000
+random flat-conjunctive queries, the whole class the join covers, ground answers and free-variable
+answers alike:
 
 ```
-4000 random trials: 3894 leapfrog, 106 fallback, 283 non-empty, 0 mismatches
+4000 random trials: 3894 leapfrog (ground), 106 leapfrog (free-var), 0 fallback, 283 non-empty, 0 mismatches
 ```
 
 ## Data-side capture of a compound
@@ -65,13 +68,17 @@ binds `$p = b` through the data variable `$d` capturing `(b)`, then `(r (a $p) b
 bind fact subterms but not the reverse, returns nothing here. The leapfrog captures the compound,
 and matches the ProductZipper and SWI-Prolog under occurs-check.
 
-The join covers the flat conjunctive queries whole, and the compound-capture shapes the matcher
-handles: a data variable capturing a query compound, cyclic capture, nested coreference, and the
-occurs-check (which correctly returns nothing). It declines one shape, where a single data variable
-both captures a non-ground compound and propagates that capture through the join
-(`(e (k $x0) $x1) (e (k $x1) $x2) (h $x2 $x0)`). Forcing it there produces one answer the
-ProductZipper does not, so the router keeps that shape on the ProductZipper. The gate is in the
-join module, self-contained, so a body that would diverge is never routed.
+The join covers the flat conjunctive queries whole, ground answers and free-variable answers alike,
+and the compound-capture shapes the matcher handles: a data variable capturing a query compound,
+cyclic capture, nested coreference, and the occurs-check (which correctly returns nothing). One
+shape it declines, where a single data variable both captures a non-ground compound and propagates
+that capture through the join (`(e (k $x0) $x1) (e (k $x1) $x2) (h $x2 $x0)`). That decline is not a
+gap left to close. `ZipperUnifySafe.thy` proves a byte-level union-find is unsound on a non-ground
+compound (the lemma `nonflat_uf_unsound`), so no per-column worst-case-optimal join can take that
+shape soundly. Answering it needs the per-tuple coupling the ProductZipper already does, and the
+router sends exactly that shape there. Every body gets MORK's answer, and every body a per-column
+WCO join can accelerate, this one does. The gate is in the join module, self-contained, so a body
+that would diverge is never routed.
 
 ## How to run
 
@@ -95,9 +102,11 @@ gate missed two flat shapes (a ground factor never checked to exist, and a data 
 leading position that should capture a query constant), both since folded into the routed class and
 covered by the 4000-trial sweep.
 
-Free-variable answers fall back too. The join computes them, but this standalone demo renders ground
-answers and leaves the fresh-variable emit to MORK, so a body whose answer carries a free variable
-routes to the ProductZipper here.
+Free-variable answers route to the leapfrog too. `unify_join_zipper_body_rows_rendered` encodes each
+answer tuple through one shared variable map, so a variable a stored fact shares across two answer
+positions (the fact `(e $u $u)` binding `$x` and `$y` together) emits as one coordinated
+NewVar/VarRef, byte-for-byte what MORK's exec emit produces. That is the `leapfrog-free` path in the
+corpus and the 106 free-variable answers in the sweep, all matching MORK.
 
 ## What the speedup is, and is not
 

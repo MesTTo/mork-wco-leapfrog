@@ -4,15 +4,16 @@
 //!
 //! Upstream MORK answers a conjunctive `(exec .. (, p1 p2 ..) ..)` with the ProductZipper, a
 //! product/nested join that is O(s^2) on the triangle. This routes a body to the variable-at-a-time
-//! leapfrog when that join is byte-identical to the ProductZipper (every factor argument is a
-//! variable and every answer component comes out ground) and falls back to the ProductZipper
-//! otherwise. So the router equals MORK's answers everywhere, and is worst-case-optimal on the
-//! conjunctive queries the leapfrog covers.
+//! leapfrog when that join is byte-identical to the ProductZipper: the whole flat conjunctive
+//! fragment (ground answers and free-variable answers) and the compound-capture shapes the matcher
+//! handles. It falls back to the ProductZipper only for the one compound shape that would diverge.
+//! So the router equals MORK's answers everywhere, and is worst-case-optimal on the conjunctive
+//! queries the leapfrog covers.
 //!
 //!   RUSTFLAGS="-C target-cpu=native" cargo +nightly run -p mork --release --example wco_leapfrog
 
 use mork::space::Space;
-use mork::zipper_join::unify_join_zipper_body_safe;
+use mork::zipper_join::{unify_join_zipper_body_rows_rendered, unify_join_zipper_body_safe};
 use mork_expr::serialize;
 use pathmap::zipper::{ZipperIteration, ZipperMoving};
 use std::collections::BTreeSet;
@@ -35,6 +36,16 @@ fn ans_string(row: &[Vec<u8>]) -> String {
     for b in row {
         v.extend_from_slice(b);
     }
+    serialize(&v)
+}
+
+/// A variable-coordinated answer tuple (the join's concatenated component encodings, free variables
+/// shared across positions) wrapped as the `(ans ..)` bytes MORK's exec emits, then serialized.
+/// `ncomp` is the number of answer components.
+fn ans_tuple_string(ncomp: usize, tuple: &[u8]) -> String {
+    let mut v = vec![ncomp as u8 + 1, 0xC0 | 3];
+    v.extend_from_slice(b"ans");
+    v.extend_from_slice(tuple);
     serialize(&v)
 }
 
@@ -100,13 +111,14 @@ fn mork_productzipper(facts: &str, patterns: &[&str], ans: &[String]) -> (BTreeS
 }
 
 /// The sound router: the WCO leapfrog when the join owns the body as byte-identical to the
-/// ProductZipper and every answer row is fully ground, else the ProductZipper. The self-contained
-/// `unify_join_zipper_body_safe` makes that call, returning the ground answer rows when the body is
-/// routable and `None` otherwise. Routable covers every flat conjunctive query and the
-/// compound-capture shapes the join handles, including a data variable that captures a query
-/// compound. It declines the one compound shape that would diverge (a capture that both binds a
-/// compound and propagates it through the join) and any free-variable answer row, which this demo
-/// leaves to MORK's emit. Returns the answers, which path ran, and the join microseconds.
+/// ProductZipper, else the ProductZipper. The self-contained `unify_join_zipper_body_safe` takes
+/// bodies whose answers are fully ground; a body whose answer carries a free variable takes the
+/// second entry, `unify_join_zipper_body_rows_rendered`, which coordinates a variable shared across
+/// answer positions so the render matches MORK's emit. Routable covers every flat conjunctive query
+/// and the compound-capture shapes the join handles, including a data variable that captures a query
+/// compound. Only the one compound shape that would diverge (a capture that both binds a compound
+/// and propagates it through the join) declines to the ProductZipper. Returns the answers, which
+/// path ran, and the join microseconds.
 fn router(facts: &str, patterns: &[&str], ans: &[String]) -> (BTreeSet<String>, &'static str, u128) {
     let body = encode_body(patterns);
     let mut space = Space::new();
@@ -116,6 +128,13 @@ fn router(facts: &str, patterns: &[&str], ans: &[String]) -> (BTreeSet<String>, 
         let us = t0.elapsed().as_micros();
         let out = rows.iter().map(|r| ans_string(r)).collect();
         return (out, "leapfrog", us);
+    }
+    // A free-variable answer: the join keeps it, coordinating a variable shared across answer
+    // positions, so render the coordinated tuples and compare to MORK's emit.
+    if let Some(tuples) = unify_join_zipper_body_rows_rendered(&space.btm, &body) {
+        let us = t0.elapsed().as_micros();
+        let out = tuples.iter().map(|t| ans_tuple_string(ans.len(), t)).collect();
+        return (out, "leapfrog-free", us);
     }
     let (pz, _, us) = mork_productzipper(facts, patterns, ans);
     (pz, "fallback", us)
@@ -147,8 +166,8 @@ impl Rng {
 
 /// A random flat conjunctive query and fact set: relations over variable/constant columns, facts
 /// that may carry data variables (schematic). No compounds, so the whole body is the leapfrog's
-/// routable class, including the constant columns and the data-variable facts that capture them;
-/// only a free-variable answer row falls back to MORK's emit.
+/// routable class: the constant columns, the data-variable facts that capture them, and the
+/// free-variable answers the coordinated renderer emits like MORK. None of it falls back.
 fn gen_case(rng: &mut Rng) -> (String, Vec<String>) {
     let rels = ["e", "p", "q", "r"];
     let vars = ["$x", "$y", "$z"];
@@ -224,7 +243,7 @@ fn main() {
     println!("\n=== 2. Correctness: router vs MORK over a random flat-conjunctive distribution ===\n");
     let mut rng = Rng(0x243F6A8885A308D3);
     let trials = 4000;
-    let (mut leapfrog, mut fallback, mut nonempty) = (0, 0, 0);
+    let (mut leapfrog, mut leapfrog_free, mut fallback, mut nonempty) = (0, 0, 0, 0);
     for i in 0..trials {
         let (facts, patterns) = gen_case(&mut rng);
         let pats: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
@@ -237,14 +256,14 @@ fn main() {
                 println!("MISMATCH trial {i} ({path})\n  facts={facts:?}\n  pats={patterns:?}\n  MORK={mork:?}\n  router={rt:?}");
             }
         }
-        if path == "leapfrog" {
-            leapfrog += 1;
-        } else {
-            fallback += 1;
+        match path {
+            "leapfrog" => leapfrog += 1,
+            "leapfrog-free" => leapfrog_free += 1,
+            _ => fallback += 1,
         }
         nonempty += !mork.is_empty() as usize;
     }
-    println!("{trials} random trials: {leapfrog} leapfrog, {fallback} fallback, {nonempty} non-empty, {bad} mismatches");
+    println!("{trials} random trials: {leapfrog} leapfrog (ground), {leapfrog_free} leapfrog (free-var), {fallback} fallback, {nonempty} non-empty, {bad} mismatches");
 
     println!("\n=== 3. Optimality: router (leapfrog) vs ProductZipper on the AGM-blowup triangle ===\n");
     let tri = &["(e $x $y)", "(e $y $z)", "(e $x $z)"];

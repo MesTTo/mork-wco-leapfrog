@@ -654,6 +654,19 @@ impl Env {
             }
         }
     }
+
+    /// Encode the whole answer tuple (query variables `0..nvars`, in order) through ONE shared
+    /// intro map, so a free variable that appears in more than one answer position (data-induced
+    /// coreference) emits as coordinated NewVar/VarRef, the way MORK's exec emit numbers the answer.
+    /// Ground and schematic components encode exactly as `encode_schematic` does.
+    fn encode_tuple_coordinated(&self, nvars: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut intro = std::collections::BTreeMap::new();
+        for v in 0..nvars {
+            self.encode_schematic_into(&Col::Var(v), &mut out, &mut intro);
+        }
+        out
+    }
 }
 
 impl Col {
@@ -901,6 +914,30 @@ pub fn unify_join_zipper_partial(
     var_order: &[usize],
     nvars: usize,
 ) -> BTreeSet<Vec<Option<Vec<u8>>>> {
+    run_unify_join(map, factors, var_order, nvars, false).out
+}
+
+/// As [`unify_join_zipper_partial`], but returns each answer as one variable-coordinated tuple
+/// encoding (query variables `0..nvars` in order, sharing one intro map), so a free variable that
+/// spans answer positions renders with coordinated NewVar/VarRef the way MORK's emit does.
+fn unify_join_zipper_coordinated(
+    map: &PathMap<()>,
+    factors: &[Factor],
+    var_order: &[usize],
+    nvars: usize,
+) -> BTreeSet<Vec<u8>> {
+    run_unify_join(map, factors, var_order, nvars, true).coordinated
+}
+
+/// Build the join state and run it. When `want_coordinated`, also collect each answer as one
+/// variable-coordinated tuple encoding (see [`unify_join_zipper_coordinated`]).
+fn run_unify_join<'a>(
+    map: &'a PathMap<()>,
+    factors: &[Factor],
+    var_order: &'a [usize],
+    nvars: usize,
+    want_coordinated: bool,
+) -> UnifyJoin<'a> {
     let nf = factors.len();
     let mut var_pos = vec![0usize; nvars];
     for (pos, &v) in var_order.iter().enumerate() {
@@ -940,9 +977,11 @@ pub fn unify_join_zipper_partial(
         stored_slots: vec![Vec::new(); nf],
         env: Env::new(nvars),
         out: BTreeSet::new(),
+        want_coordinated,
+        coordinated: BTreeSet::new(),
     };
     state.recurse(0);
-    state.out
+    state
 }
 
 /// Parse an encoded conjunction body `(, p1 .. pk)` into factors, threading the body's variable
@@ -1103,6 +1142,27 @@ pub fn unify_join_zipper_body_partial_safe(
     .flatten()
 }
 
+/// Parse, route-check, and run the zipper join, returning each answer as one variable-coordinated
+/// tuple encoding. Unlike [`unify_join_zipper_body_safe`], a free-variable answer is kept: a
+/// variable shared across answer positions emits as one coordinated variable, so the caller can
+/// render and compare free-variable answers up to consistent renaming. `None` keeps the caller on
+/// the ProductZipper path.
+pub fn unify_join_zipper_body_rows_rendered(
+    map: &PathMap<()>,
+    body: &[u8],
+) -> Option<BTreeSet<Vec<u8>>> {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (factors, nvars) = parse_body_factors(body)?;
+        if !body_factors_routable_to_zipper_join(map, &factors) {
+            return None;
+        }
+        let var_order: Vec<usize> = (0..nvars).collect();
+        Some(unify_join_zipper_coordinated(map, &factors, &var_order, nvars))
+    }))
+    .ok()
+    .flatten()
+}
+
 fn body_factors_routable_to_zipper_join(map: &PathMap<()>, factors: &[Factor]) -> bool {
     for factor in factors {
         let compound_count = factor
@@ -1228,6 +1288,11 @@ struct UnifyJoin<'a> {
     /// Answer rows, one `Option` per query variable: `Some(bytes)` for a resolved term, `None` for
     /// a still-free variable. The all-ground entry filters to fully-ground rows.
     out: BTreeSet<Vec<Option<Vec<u8>>>>,
+    /// When set, also collect each answer as one variable-coordinated tuple encoding in `coordinated`.
+    want_coordinated: bool,
+    /// Answer tuples encoded through one shared intro map, so free-variable coreference across answer
+    /// positions survives for the live renderer. Empty unless `want_coordinated`.
+    coordinated: BTreeSet<Vec<u8>>,
 }
 
 impl UnifyJoin<'_> {
@@ -1246,6 +1311,10 @@ impl UnifyJoin<'_> {
             let row: Vec<Option<Vec<u8>>> =
                 (0..self.nvars).map(|v| self.env.term_bytes_of(v)).collect();
             self.out.insert(row);
+            if self.want_coordinated {
+                self.coordinated
+                    .insert(self.env.encode_tuple_coordinated(self.nvars));
+            }
             return;
         }
         let v = self.var_order[i];
@@ -1652,6 +1721,34 @@ mod tests {
         assert!(
             unify_join_zipper_body_safe(&map, &body).is_none(),
             "the all-ground entry must not silently drop non-ground rows"
+        );
+    }
+
+    #[test]
+    fn coordinated_rows_preserve_free_var_coreference() {
+        // A schematic fact (e $u $u) couples the two query variables: matching (e $x $y) binds both
+        // to one free variable. The coordinated tuple must share it (NewVar then VarRef(0)), the way
+        // MORK's emit numbers a coreferent answer.
+        let mut coref = PathMap::<()>::new();
+        coref.insert(&nest("e", &[new_var(), var_ref(0)]), ()); // (e $u $u)
+        let body = conj(&[nest("e", &[new_var(), new_var()])]); // (e $x $y)
+        let rows = unify_join_zipper_body_rows_rendered(&coref, &body).expect("flat body routes");
+        assert_eq!(rows.len(), 1, "one answer: $x and $y are the same free variable");
+        assert_eq!(
+            rows.iter().next().unwrap(),
+            &vec![NEWVAR_BYTE, TAG_VARREF | 0],
+            "coreferent free variables must coordinate to NewVar, VarRef(0)"
+        );
+
+        // Two independent data variables stay distinct: two NewVars, no back-reference.
+        let mut indep = PathMap::<()>::new();
+        indep.insert(&nest("e", &[new_var(), new_var()]), ()); // (e $u $w)
+        let indep_rows =
+            unify_join_zipper_body_rows_rendered(&indep, &body).expect("flat body routes");
+        assert_eq!(
+            indep_rows.iter().next().unwrap(),
+            &vec![NEWVAR_BYTE, NEWVAR_BYTE],
+            "independent free variables must stay distinct NewVars"
         );
     }
 
