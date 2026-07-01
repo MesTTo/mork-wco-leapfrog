@@ -1,21 +1,21 @@
 # A worst-case-optimal join for MORK
 
-Upstream MORK answers a conjunctive `(exec .. (, p1 p2 ..) ..)` with the ProductZipper, a
-product/nested join. On a triangle query over a hub it builds the O(s²) two-paths through the hub
-before pruning them down to the few real triangles. This adds a variable-at-a-time leapfrog join
-(`overlay/zipper_join.rs`) that seeks the PathMap byte-trie directly and intersects the factors on
-each shared variable, so it never materializes those intermediates. Behind a sound router it
-returns exactly MORK's answers, and on the triangle it runs in O(s).
+MORK evaluates a conjunctive `(exec .. (, p1 p2 ..) ..)` body with the ProductZipper, a
+relation-at-a-time join that materializes the intermediate product before pruning it. On a triangle
+over a hub that product is the s² two-paths through the hub, pruned to the few real triangles. This
+adds a variable-at-a-time leapfrog join (`overlay/zipper_join.rs`) that seeks the PathMap byte-trie
+directly and intersects the factors on each shared variable, so the two-paths are never built.
+Behind a sound router it returns exactly MORK's bytes, and on the triangle it seeks in O(s).
 
-The join carries unification, not equality alone. A variable in a stored fact is a wildcard, and it
-can bind a query subterm, so the join does data-side capture: given a query `(r (a $p) b)` and a
-fact `(r $d b)`, the stored `$d` absorbs the whole compound `(a $p)`. That is the step that makes
-this unification and not a relational join, and it is the case MORK's own matcher handles that a
-plain leapfrog does not. Everything runs over MORK's live PathMap, with no copy of the data.
+The join unifies in both directions. A variable in a stored fact is a wildcard that can bind a query
+subterm, so the join does data-side capture: for a query `(r (a $p) b)` against a fact `(r $d b)`,
+the stored `$d` binds the whole compound `(a $p)`. That second direction, stored variables binding
+query subterms, is the step MORK's matcher performs and a relational leapfrog does not. Everything
+runs over MORK's live PathMap, with no copy of the data.
 
 ## The result
 
-Run over stock upstream MORK on the AGM-blowup triangle `(e $x $y) (e $y $z) (e $x $z)` over a hub
+Run over stock MORK on the AGM-blowup triangle `(e $x $y) (e $y $z) (e $x $z)` over a hub
 of `s` in-edges and `s` out-edges (plus three ground triangles):
 
 ```
@@ -31,9 +31,9 @@ O(s) on this instance: its microseconds double when s doubles. So the speedup gr
 246× at s = 4096. Both return the same three triangles. The leapfrog column is the whole sound
 path, the routability check plus the join, not the join alone.
 
-## It equals MORK's answers
+## Byte-identical to MORK
 
-The join is not a different semantics. A router sends a body to the leapfrog only when the join is
+The router preserves MORK's semantics exactly. It sends a body to the leapfrog only when the join is
 provably byte-identical to the ProductZipper, and falls back otherwise, so the answers always match
 MORK. `run.sh` checks this two ways.
 
@@ -68,17 +68,17 @@ binds `$p = b` through the data variable `$d` capturing `(b)`, then `(r (a $p) b
 bind fact subterms but not the reverse, returns nothing here. The leapfrog captures the compound,
 and matches the ProductZipper and SWI-Prolog under occurs-check.
 
-The join covers the flat conjunctive queries whole, ground answers and free-variable answers alike,
-and the compound-capture shapes the matcher handles: a data variable capturing a query compound,
+The join covers the flat conjunctive fragment whole, ground and free-variable answers alike, and the
+compound-capture shapes the matcher handles: a data variable capturing a query compound,
 cyclic capture, nested coreference, and the occurs-check (which correctly returns nothing). One
 shape it declines, where a single data variable both captures a non-ground compound and propagates
 that capture through the join (`(e (k $x0) $x1) (e (k $x1) $x2) (h $x2 $x0)`). That decline is not a
 gap left to close. `ZipperUnifySafe.thy` proves a byte-level union-find is unsound on a non-ground
 compound (the lemma `nonflat_uf_unsound`), so no per-column worst-case-optimal join can take that
 shape soundly. Answering it needs the per-tuple coupling the ProductZipper already does, and the
-router sends exactly that shape there. Every body gets MORK's answer, and every body a per-column
-WCO join can accelerate, this one does. The gate is in the join module, self-contained, so a body
-that would diverge is never routed.
+router sends exactly that shape there. Every body gets MORK's answer; every shape a per-column WCO
+join can soundly take, this one takes. The gate lives in the join module, self-contained, so a
+divergent body is never routed.
 
 ## How to run
 
@@ -86,7 +86,7 @@ that would diverge is never routed.
 ./run.sh
 ```
 
-It clones upstream MORK (trueagi-io/MORK) and PathMap (Adam-Vandervorst/PathMap) at the pinned
+It clones MORK (trueagi-io/MORK) and PathMap (Adam-Vandervorst/PathMap) at the pinned
 commits into `build/`, overlays the one module and the one example, and runs the demonstration.
 Needs a nightly Rust toolchain; `RUSTFLAGS="-C target-cpu=native"` is set for you (gxhash needs
 aes and sse2).
@@ -108,7 +108,7 @@ positions (the fact `(e $u $u)` binding `$x` and `$y` together) emits as one coo
 NewVar/VarRef, byte-for-byte what MORK's exec emit produces. That is the `leapfrog-free` path in the
 corpus and the 106 free-variable answers in the sweep, all matching MORK.
 
-## What the speedup is, and is not
+## Scope of the speedup
 
 The win is on join-bound conjunctive queries, where the ProductZipper materializes an intermediate
 the worst-case-optimal join prunes. The triangle is that case. It is not a claim about MeTTa program
@@ -120,7 +120,7 @@ the next step; the router here is a standalone demonstration of the join and its
 ## Provenance
 
 - MORK: `trueagi-io/MORK` at `4a101d1`, unchanged except the single `pub mod zipper_join;` line the
-  overlay adds to `kernel/src/lib.rs`. The ProductZipper it is measured against is upstream's.
+  overlay adds to `kernel/src/lib.rs`. The ProductZipper it is measured against is MORK's own.
 - PathMap: `Adam-Vandervorst/PathMap` at `5569535`.
 - Overlay: `zipper_join.rs` (the join, depends only on PathMap) and `wco_leapfrog.rs` (the
   demonstration, depends only on MORK + PathMap).

@@ -1,11 +1,11 @@
 //! Zipper-native worst-case-optimal unification leapfrog over variable-width MORK terms.
 //!
-//! Upstream MORK answers a conjunctive query with the ProductZipper, a product/nested join that
-//! materializes intermediate results before pruning them. This module instead seeks directly,
-//! variable-at-a-time, on the PathMap byte-trie: a join variable's
-//! value is a variable-width subterm, found by descending the trie with `child_mask` +
-//! `descend_to_byte`, its boundary tracked by a parse stack, and a stored variable in the data
-//! is a wildcard that unifies. No domain is materialized.
+//! MORK answers a conjunctive query with the ProductZipper, a relation-at-a-time join that
+//! materializes the intermediate product before pruning it. This module seeks directly instead,
+//! variable-at-a-time, on the PathMap byte-trie: a join variable's value is a variable-width
+//! subterm, found by descending the trie with `child_mask` + `descend_to_byte`, its boundary
+//! tracked by a parse stack, and a stored variable in the data is a wildcard that unifies. No
+//! domain is materialized.
 //!
 //! Built bottom-up, each layer validated before the next: the byte-scan and the subterm parser
 //! here, then the zipper subterm cursor, then the unification leapfrog, gated against the

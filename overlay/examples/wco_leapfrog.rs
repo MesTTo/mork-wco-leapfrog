@@ -1,14 +1,13 @@
-//! A worst-case-optimal join for MORK: the leapfrog-unification join (`zipper_join`, ported
-//! verbatim into upstream) behind a sound router, over MORK's LIVE PathMap. Depends only on stock
-//! MORK + PathMap.
+//! A worst-case-optimal join for MORK: the leapfrog-unification join in `zipper_join`, behind a
+//! sound router, over MORK's live PathMap.
 //!
-//! Upstream MORK answers a conjunctive `(exec .. (, p1 p2 ..) ..)` with the ProductZipper, a
-//! product/nested join that is O(s^2) on the triangle. This routes a body to the variable-at-a-time
-//! leapfrog when that join is byte-identical to the ProductZipper: the whole flat conjunctive
-//! fragment (ground answers and free-variable answers) and the compound-capture shapes the matcher
-//! handles. It falls back to the ProductZipper only for the one compound shape that would diverge.
-//! So the router equals MORK's answers everywhere, and is worst-case-optimal on the conjunctive
-//! queries the leapfrog covers.
+//! MORK answers a conjunctive `(exec .. (, p1 p2 ..) ..)` with the ProductZipper, a
+//! relation-at-a-time join that is O(s^2) on the triangle. A router sends a body to the
+//! variable-at-a-time leapfrog when that join is byte-identical to the ProductZipper: the whole
+//! flat conjunctive fragment (ground answers and free-variable answers) and the compound-capture
+//! shapes the matcher handles. It falls back to the ProductZipper only for the one compound shape
+//! that would diverge. So the router equals MORK's answers everywhere, and is worst-case-optimal on
+//! the conjunctive queries the leapfrog covers.
 //!
 //!   RUSTFLAGS="-C target-cpu=native" cargo +nightly run -p mork --release --example wco_leapfrog
 
