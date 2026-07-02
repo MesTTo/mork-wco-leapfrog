@@ -11,7 +11,9 @@ The join unifies in both directions. A variable in a stored fact is a wildcard t
 subterm, so the join does data-side capture: for a query `(r (a $p) b)` against a fact `(r $d b)`,
 the stored `$d` binds the whole compound `(a $p)`. That second direction, stored variables binding
 query subterms, is the step MORK's matcher performs and a relational leapfrog does not. Everything
-runs over MORK's live PathMap, with no copy of the data.
+runs over MORK's live PathMap, with no copy of the data. The term encoding, the unification, and
+the answer emit are `mork_expr`'s own (`Tag`/`byte_item`, `unify`, `apply`); the module contributes
+the seek order.
 
 ## The result
 
@@ -20,17 +22,17 @@ of `s` in-edges and `s` out-edges (plus three ground triangles):
 
 ```
     s  ans | PZ transitions       PZ us | leapfrog us | PZ/leapfrog   PZ us/s^2
-  128    3 |         99654        3040 |         360 |      8.4x        0.19
-  256    3 |        395846        9644 |         688 |     14.0x        0.15
-  512    3 |       1578054       39574 |        1335 |     29.6x        0.15
- 1024    3 |       6301766      155005 |        2661 |     58.3x        0.15
- 2048    3 |      25186374      623919 |        5299 |    117.7x        0.15
- 4096    3 |     100704326     2482307 |       10528 |    235.8x        0.15
+  128    3 |         99654        2367 |         368 |      6.4x        0.14
+  256    3 |        395846       10220 |         742 |     13.8x        0.16
+  512    3 |       1578054       38313 |        1427 |     26.8x        0.15
+ 1024    3 |       6301766      151808 |        2836 |     53.5x        0.14
+ 2048    3 |      25186374      613592 |        5794 |    105.9x        0.15
+ 4096    3 |     100704326     2470528 |       11156 |    221.5x        0.15
 ```
 
 The ProductZipper is Θ(s²): its transitions grow as s² and its microseconds over s² stay flat at
 0.15 as s grows. The leapfrog is O(s) on this instance: its microseconds double when s doubles. So
-the speedup grows with s, to 236× at s = 4096. Both return the same three triangles. The leapfrog
+the speedup grows with s, to 221× at s = 4096. Both return the same three triangles. The leapfrog
 column times the whole sound path, the routability check and the join together.
 
 ## Byte-identical to MORK
@@ -124,13 +126,14 @@ the next step; the router here is a standalone demonstration of the join and its
 - MORK: `trueagi-io/MORK` at `4a101d1`, unchanged except the single `pub mod zipper_join;` line the
   overlay adds to `kernel/src/lib.rs`. The ProductZipper it is measured against is MORK's own.
 - PathMap: `Adam-Vandervorst/PathMap` at `5569535`.
-- Overlay: `zipper_join.rs` (the join, depends only on PathMap) and `wco_leapfrog.rs` (the
-  demonstration, depends only on MORK + PathMap).
+- Overlay: `zipper_join.rs` (the join, depends only on PathMap and MORK's `expr`) and
+  `wco_leapfrog.rs` (the demonstration, depends only on MORK + PathMap).
 
 ## Proofs
 
 `proofs/` holds the Isabelle theories behind the design (Isabelle2025). `ZipperUnifySafe.thy`
-proves the trail/union-find the join threads is sound. `RoutingSafe.thy` proves that on flat data a
-union-find agreement equals first-order unification, and that on non-flat data it does not, which is
-why a compound is checked against the matcher before routing rather than assumed safe. The specific
-gate and the one divergent shape are checked empirically by the differential, not by these theories.
+proves the per-column union-find semantics behind the join is sound. `RoutingSafe.thy` proves that
+on flat data a union-find agreement equals first-order unification, and that on non-flat data it
+does not, which is why a compound is checked against the matcher before routing rather than assumed
+safe. The specific gate and the one divergent shape are checked empirically by the differential,
+not by these theories.

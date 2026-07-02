@@ -5,26 +5,23 @@
 //! variable-at-a-time, on the PathMap byte-trie: a join variable's value is a variable-width
 //! subterm, found by descending the trie with `child_mask` + `descend_to_byte`, its boundary
 //! tracked by a parse stack, and a stored variable in the data is a wildcard that unifies. No
-//! domain is materialized.
+//! domain is materialized. The term encoding, the unification, and the answer emit are
+//! `mork_expr`'s own (`Tag`/`byte_item`, `unify`, `apply`); this module contributes the seek
+//! order.
 //!
 //! Built bottom-up, each layer validated before the next: the byte-scan and the subterm parser
 //! here, then the zipper subterm cursor, then the unification leapfrog, gated against the
 //! ProductZipper.
 
+use mork_expr::{Expr, ExprEnv, ExprZipper, Tag, byte_item, item_byte, unify};
 use pathmap::PathMap;
 use pathmap::utils::ByteMask;
 use pathmap::zipper::{Zipper, ZipperAbsolutePath, ZipperIteration, ZipperMoving, ZipperValues};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-// MORK tag bytes (top two bits select the tag).
-const TOP2: u8 = 0b1100_0000;
-const TAG_ARITY: u8 = 0b0000_0000;
-const TAG_VARREF: u8 = 0b1000_0000;
-#[cfg(test)]
-const TAG_SYMSIZE: u8 = 0b1100_0000;
-const NEWVAR_BYTE: u8 = 0b1100_0000;
-const LOW6: u8 = 0b0011_1111;
+const QUERY_NS: u8 = 0;
+const NEW_VAR_EXPR_BYTES: [u8; 1] = [item_byte(Tag::NewVar)];
 
 /// The least byte present in `mask` that is `>= k`, or `None` if every set bit is below `k`.
 /// `ByteMask::next_bit` returns the least bit strictly above its argument, so test `k` itself
@@ -55,19 +52,13 @@ fn try_parse_first_subterm(bytes: &[u8]) -> Option<(usize, bool)> {
         let b = *bytes.get(i)?;
         i += 1;
         remaining -= 1;
-        match b & TOP2 {
-            TAG_ARITY => remaining += (b & LOW6) as usize,
-            TAG_VARREF => ground = false,
-            _ => {
-                // 0b11xxxxxx: NewVar (exactly 0xC0) is a one-byte variable; SymbolSize carries `s`
-                // payload bytes.
-                if b == NEWVAR_BYTE {
-                    ground = false;
-                } else {
-                    i = i.checked_add((b & LOW6) as usize)?;
-                    if i > bytes.len() {
-                        return None;
-                    }
+        match byte_item(b) {
+            Tag::Arity(arity) => remaining += arity as usize,
+            Tag::VarRef(_) | Tag::NewVar => ground = false,
+            Tag::SymbolSize(size) => {
+                i = i.checked_add(size as usize)?;
+                if i > bytes.len() {
+                    return None;
                 }
             }
         }
@@ -95,14 +86,10 @@ fn step_parse(b: u8, subterms: &mut usize, payload: &mut usize) {
         *payload -= 1;
     } else {
         *subterms -= 1;
-        match b & TOP2 {
-            TAG_ARITY => *subterms += (b & LOW6) as usize,
-            TAG_VARREF => {}
-            _ => {
-                if b != NEWVAR_BYTE {
-                    *payload += (b & LOW6) as usize;
-                }
-            }
+        match byte_item(b) {
+            Tag::Arity(arity) => *subterms += arity as usize,
+            Tag::SymbolSize(size) => *payload += size as usize,
+            Tag::VarRef(_) | Tag::NewVar => {}
         }
     }
 }
@@ -309,20 +296,67 @@ fn intersect<Z: Zipper + ZipperMoving>(cursors: &mut [SubtermCursor<Z>]) -> Vec<
     }
 }
 
-/// A non-ground compound query argument. `arity` is the leading arity byte, and `children`
-/// are the compound's encoded children in order, including the head.
+/// The `(namespace, variable)` key of `mork_expr::unify`'s bindings map. `mork_expr` keeps its
+/// `ExprVar = (u8, u8)` alias private, so the concrete pair type is named again here.
+type BindingKey = (u8, u8);
+type Bindings = BTreeMap<BindingKey, ExprEnv>;
+
+/// A materialized encoded term plus the query-variable intro count before it in the original body.
+/// The bytes stay in MORK's native encoding; unification and substitution operate through
+/// [`ExprEnv`] views over them.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompoundPat {
-    pub arity: u8,
-    pub children: Vec<Col>,
+pub struct EncodedTerm {
+    pub bytes: Vec<u8>,
+    pub intro: u8,
 }
 
-/// One query argument column in a factor.
+impl EncodedTerm {
+    fn new(bytes: Vec<u8>, intro: u8) -> Self {
+        EncodedTerm { bytes, intro }
+    }
+
+    fn expr(&self) -> Expr {
+        expr_from_bytes(&self.bytes)
+    }
+
+    fn tag(&self) -> Tag {
+        byte_item(self.bytes[0])
+    }
+
+    fn is_ground(&self) -> bool {
+        expr_is_ground(self.expr())
+    }
+
+    fn is_nonground_compound(&self) -> bool {
+        matches!(self.tag(), Tag::Arity(_)) && !self.is_ground()
+    }
+
+    fn min_var_pos(&self, var_pos: &[usize]) -> Option<usize> {
+        min_var_pos_in_expr(self.expr(), self.intro, var_pos)
+    }
+}
+
+/// One query argument column in a factor. Top-level variables are exposed so the leapfrog order can
+/// seek them directly; every structured or ground column stays as native encoded bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Col {
+pub enum FactorColumn {
     Var(usize),
-    Ground(Vec<u8>),
-    Compound(Box<CompoundPat>),
+    Term(EncodedTerm),
+}
+
+impl FactorColumn {
+    fn min_var_pos(&self, var_pos: &[usize]) -> Option<usize> {
+        match self {
+            FactorColumn::Var(v) => Some(var_pos[*v]),
+            FactorColumn::Term(term) => term.min_var_pos(var_pos),
+        }
+    }
+
+    /// Whether this column is a compound containing a variable, the shape the routing gate
+    /// inspects.
+    pub fn is_nonground_compound(&self) -> bool {
+        matches!(self, FactorColumn::Term(term) if term.is_nonground_compound())
+    }
 }
 
 /// A query factor: its relation prefix in the PathMap, and every argument column in syntactic
@@ -331,14 +365,109 @@ pub enum Col {
 #[derive(Clone, Debug)]
 pub struct Factor {
     pub prefix: Vec<u8>,
-    pub cols: Vec<Col>,
+    pub cols: Vec<FactorColumn>,
 }
 
 impl Factor {
     pub fn var_cols(prefix: Vec<u8>, cols: Vec<usize>) -> Self {
         Factor {
             prefix,
-            cols: cols.into_iter().map(Col::Var).collect(),
+            cols: cols.into_iter().map(FactorColumn::Var).collect(),
+        }
+    }
+}
+
+fn expr_from_bytes(bytes: &[u8]) -> Expr {
+    Expr {
+        ptr: bytes.as_ptr().cast_mut(),
+    }
+}
+
+fn expr_span_len(expr: Expr) -> usize {
+    unsafe { expr.span().as_ref().unwrap().len() }
+}
+
+fn expr_is_ground(expr: Expr) -> bool {
+    let mut ez = ExprZipper::new(expr);
+    loop {
+        match ez.tag() {
+            Tag::NewVar | Tag::VarRef(_) => return false,
+            Tag::SymbolSize(_) | Tag::Arity(_) => {}
+        }
+        if !ez.next() {
+            return true;
+        }
+    }
+}
+
+fn expr_children(term: &EncodedTerm) -> Option<Vec<EncodedTerm>> {
+    let Tag::Arity(arity) = term.tag() else {
+        return None;
+    };
+    let mut children = Vec::with_capacity(arity as usize);
+    if arity == 0 {
+        return Some(children);
+    }
+    let mut ez = ExprZipper::new(term.expr());
+    let mut intro = term.intro;
+    for _ in 0..arity {
+        if !ez.next_child() {
+            return None;
+        }
+        let child_expr = ez.subexpr();
+        let len = expr_span_len(child_expr);
+        let start = ez.loc;
+        let child_bytes = term.bytes.get(start..start + len)?.to_vec();
+        children.push(EncodedTerm::new(child_bytes, intro));
+        let next_intro = intro as usize + child_expr.newvars();
+        if next_intro > u8::MAX as usize {
+            return None;
+        }
+        intro = next_intro as u8;
+    }
+    Some(children)
+}
+
+fn validate_vars_and_count(expr: Expr) -> Option<usize> {
+    let mut ez = ExprZipper::new(expr);
+    let mut intros = 0usize;
+    loop {
+        match ez.tag() {
+            Tag::NewVar => {
+                intros = intros.checked_add(1)?;
+                if intros > u8::MAX as usize {
+                    return None;
+                }
+            }
+            Tag::VarRef(i) if i as usize >= intros => return None,
+            Tag::VarRef(_) | Tag::SymbolSize(_) | Tag::Arity(_) => {}
+        }
+        if !ez.next() {
+            return Some(intros);
+        }
+    }
+}
+
+fn min_var_pos_in_expr(expr: Expr, intro_start: u8, var_pos: &[usize]) -> Option<usize> {
+    let mut ez = ExprZipper::new(expr);
+    let mut intro = intro_start as usize;
+    let mut min_pos: Option<usize> = None;
+    loop {
+        let var = match ez.tag() {
+            Tag::NewVar => {
+                let id = intro;
+                intro += 1;
+                Some(id)
+            }
+            Tag::VarRef(i) => Some(i as usize),
+            Tag::SymbolSize(_) | Tag::Arity(_) => None,
+        };
+        if let Some(id) = var {
+            let pos = var_pos[id];
+            min_pos = Some(min_pos.map_or(pos, |current| current.min(pos)));
+        }
+        if !ez.next() {
+            return min_pos;
         }
     }
 }
@@ -395,7 +524,7 @@ impl GroundJoin<'_> {
         let parts: Vec<usize> = (0..self.factors.len())
             .filter(|&f| {
                 let nc = self.next_col[f];
-                matches!(self.factors[f].cols.get(nc), Some(Col::Var(cv)) if *cv == v)
+                matches!(self.factors[f].cols.get(nc), Some(FactorColumn::Var(cv)) if *cv == v)
             })
             .collect();
 
@@ -465,10 +594,9 @@ impl GroundJoin<'_> {
             return;
         };
         let target = match col {
-            Col::Ground(g) => Some(g),
-            Col::Var(v) if !self.binding[v].is_empty() => Some(self.binding[v].clone()),
-            Col::Var(_) => None,
-            Col::Compound(_) => None,
+            FactorColumn::Term(term) if term.is_ground() => Some(term.bytes),
+            FactorColumn::Var(v) if !self.binding[v].is_empty() => Some(self.binding[v].clone()),
+            FactorColumn::Var(_) | FactorColumn::Term(_) => None,
         };
         let Some(target) = target else {
             self.catch_up(i, f + 1);
@@ -485,280 +613,44 @@ impl GroundJoin<'_> {
 
 // ---- unification layer: schematic data (stored variables in facts act as wildcards) ----
 
-/// Trail-backed first-order unifier over MORK byte terms. Query variables hold ids `0..nvars`;
-/// stored data variables get fresh ids past that, allocated per fact descent so they are renamed
-/// apart across facts.
-struct Env {
-    slots: Vec<Option<Col>>,
-    trail: Vec<usize>,
-}
-
-impl Env {
-    fn new(nvars: usize) -> Env {
-        Env {
-            slots: vec![None; nvars],
-            trail: Vec::new(),
-        }
-    }
-
-    /// Allocate a fresh (unbound) variable id, for a stored data variable.
-    fn fresh(&mut self) -> usize {
-        self.slots.push(None);
-        self.slots.len() - 1
-    }
-
-    fn mark(&self) -> usize {
-        self.trail.len()
-    }
-
-    fn rollback(&mut self, m: usize) {
-        while self.trail.len() > m {
-            let id = self.trail.pop().unwrap();
-            self.slots[id] = None;
-        }
-    }
-
-    fn bind_term(&mut self, id: usize, term: Col) {
-        self.slots[id] = Some(term);
-        self.trail.push(id);
-    }
-
-    fn resolve_term(&self, term: &Col) -> Col {
-        match term {
-            Col::Var(id) => match &self.slots[*id] {
-                Some(bound) => self.resolve_term(bound),
-                None => Col::Var(*id),
-            },
-            Col::Ground(g) => Col::Ground(g.clone()),
-            Col::Compound(compound) => Col::Compound(Box::new(CompoundPat {
-                arity: compound.arity,
-                children: compound
-                    .children
-                    .iter()
-                    .map(|child| self.resolve_term(child))
-                    .collect(),
-            })),
-        }
-    }
-
-    fn unify_terms(&mut self, a: &Col, b: &Col) -> bool {
-        let mark = self.mark();
-        if self.unify_terms_inner(a, b) {
-            true
-        } else {
-            self.rollback(mark);
-            false
-        }
-    }
-
-    fn unify_terms_inner(&mut self, a: &Col, b: &Col) -> bool {
-        let a = self.resolve_term(a).structural_ground();
-        let b = self.resolve_term(b).structural_ground();
-        match (&a, &b) {
-            (Col::Var(x), Col::Var(y)) if x == y => true,
-            (Col::Var(x), _) => {
-                if self.occurs(*x, &b) {
-                    false
-                } else {
-                    self.bind_term(*x, b);
-                    true
-                }
-            }
-            (_, Col::Var(y)) => {
-                if self.occurs(*y, &a) {
-                    false
-                } else {
-                    self.bind_term(*y, a);
-                    true
-                }
-            }
-            (Col::Ground(ga), Col::Ground(gb)) => ga == gb,
-            (Col::Compound(ca), Col::Compound(cb)) => {
-                if ca.arity != cb.arity || ca.children.len() != cb.children.len() {
-                    return false;
-                }
-                ca.children
-                    .iter()
-                    .zip(&cb.children)
-                    .all(|(x, y)| self.unify_terms_inner(x, y))
-            }
-            _ => false,
-        }
-    }
-
-    fn occurs(&self, id: usize, term: &Col) -> bool {
-        match self.resolve_term(term).structural_ground() {
-            Col::Var(v) => v == id,
-            Col::Ground(_) => false,
-            Col::Compound(compound) => compound.children.iter().any(|child| self.occurs(id, child)),
-        }
-    }
-
-    /// Unify variable `id` with a ground value `g`. False on a clash.
-    fn unify_var_ground(&mut self, id: usize, g: &[u8]) -> bool {
-        self.unify_terms(&Col::Var(id), &Col::Ground(g.to_vec()))
-    }
-
-    /// Unify variable `id` with `term`. False on a clash or occurs-check failure.
-    fn unify_var_term(&mut self, id: usize, term: &Col) -> bool {
-        self.unify_terms(&Col::Var(id), term)
-    }
-
-    /// Unify two variables. False on a clash or occurs-check failure.
-    fn unify_var_var(&mut self, a: usize, b: usize) -> bool {
-        self.unify_terms(&Col::Var(a), &Col::Var(b))
-    }
-
-    /// The ground value a query variable resolved to, or `None` if it is still free or schematic.
-    #[cfg(test)]
-    fn ground_of(&self, id: usize) -> Option<Vec<u8>> {
-        self.term_bytes_of(id)
-            .filter(|bytes| first_subterm_is_ground(bytes))
-    }
-
-    /// The resolved bytes for a query variable. A free variable returns `None`; a variable bound to
-    /// a compound containing free variables returns canonical schematic bytes.
-    fn term_bytes_of(&self, id: usize) -> Option<Vec<u8>> {
-        match self.resolve_term(&Col::Var(id)) {
-            Col::Var(_) => None,
-            term => Some(self.encode_schematic(&term)),
-        }
-    }
-
-    fn encode_schematic(&self, term: &Col) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut intro = std::collections::BTreeMap::new();
-        self.encode_schematic_into(term, &mut out, &mut intro);
-        out
-    }
-
-    fn encode_schematic_into(
-        &self,
-        term: &Col,
-        out: &mut Vec<u8>,
-        intro: &mut std::collections::BTreeMap<usize, u8>,
-    ) {
-        match self.resolve_term(term) {
-            Col::Var(id) => match intro.get(&id) {
-                Some(&level) => out.push(TAG_VARREF | level),
-                None => {
-                    let level = intro.len() as u8;
-                    intro.insert(id, level);
-                    out.push(NEWVAR_BYTE);
-                }
-            },
-            Col::Ground(g) => out.extend_from_slice(&g),
-            Col::Compound(compound) => {
-                out.push(compound.arity);
-                for child in &compound.children {
-                    self.encode_schematic_into(child, out, intro);
-                }
-            }
-        }
-    }
-
-    /// Encode the whole answer tuple (query variables `0..nvars`, in order) through ONE shared
-    /// intro map, so a free variable that appears in more than one answer position (data-induced
-    /// coreference) emits as coordinated NewVar/VarRef, the way MORK's exec emit numbers the answer.
-    /// Ground and schematic components encode exactly as `encode_schematic` does.
-    fn encode_tuple_coordinated(&self, nvars: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut intro = std::collections::BTreeMap::new();
-        for v in 0..nvars {
-            self.encode_schematic_into(&Col::Var(v), &mut out, &mut intro);
-        }
-        out
-    }
-}
-
-impl Col {
-    fn structural_ground(self) -> Col {
-        match self {
-            Col::Ground(g) if !g.is_empty() && g[0] & TOP2 == TAG_ARITY => {
-                Col::Compound(Box::new(compound_from_ground_bytes(&g)))
-            }
-            other => other,
-        }
-    }
-
-    fn min_var_pos(&self, var_pos: &[usize]) -> Option<usize> {
-        match self {
-            Col::Var(v) => Some(var_pos[*v]),
-            Col::Ground(_) => None,
-            Col::Compound(compound) => compound
-                .children
-                .iter()
-                .filter_map(|child| child.min_var_pos(var_pos))
-                .min(),
-        }
-    }
-}
-
-fn compound_from_ground_bytes(bytes: &[u8]) -> CompoundPat {
-    debug_assert!(!bytes.is_empty() && bytes[0] & TOP2 == TAG_ARITY);
-    let arity = bytes[0];
-    let mut children = Vec::with_capacity((arity & LOW6) as usize);
-    let mut pos = 1usize;
-    for _ in 0..(arity & LOW6) as usize {
-        let len = first_subterm_len(&bytes[pos..]);
-        children.push(Col::Ground(bytes[pos..pos + len].to_vec()));
-        pos += len;
-    }
-    debug_assert_eq!(pos, bytes.len());
-    CompoundPat { arity, children }
-}
-
-/// A candidate child at a factor's column: a ground subterm value, or a stored-variable wildcard
-/// (its one tag byte: NewVar `0xC0` or VarRef `0x80|i`).
-enum Cand {
-    Ground(Vec<u8>),
-    Wild(u8),
-}
-
 #[inline]
-fn is_wildcard_byte(k: &[u8]) -> bool {
-    k.len() == 1 && (0x80..=0xC0).contains(&k[0])
+fn is_wildcard_term(k: &[u8]) -> bool {
+    k.len() == 1 && matches!(byte_item(k[0]), Tag::NewVar | Tag::VarRef(_))
 }
 
 /// The children of a factor's current column when the join variable is still free. This is the
 /// lead, which enumerates the whole column (structured children and wildcards alike).
-fn free_candidates<Z: Zipper + ZipperMoving>(cur: &mut SubtermCursor<Z>) -> Vec<Cand> {
+fn free_candidates<Z: Zipper + ZipperMoving>(cur: &mut SubtermCursor<Z>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     cur.first();
     while let Some(k) = cur.key() {
-        if is_wildcard_byte(k) {
-            out.push(Cand::Wild(k[0]));
-        } else {
-            out.push(Cand::Ground(k.to_vec()));
-        }
+        out.push(k.to_vec());
         cur.next();
     }
     out
 }
 
-fn add_ground_matches<Z: Zipper + ZipperMoving>(
+/// The candidates at a ground column: the exact ground subterm if the trie holds it, plus every
+/// stored wildcard at that position. Wildcards are one tag byte in the contiguous range
+/// `VarRef(0)..=NewVar`, so one seek to `VarRef(0)` and a scan while-wildcard covers them all.
+fn ground_candidates<Z: Zipper + ZipperMoving>(
     cur: &mut SubtermCursor<Z>,
     g: &[u8],
-    out: &mut Vec<Cand>,
-) {
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
     cur.seek(g);
     if cur.key() == Some(g) {
-        out.push(Cand::Ground(g.to_vec()));
+        out.push(g.to_vec());
     }
-    cur.seek(&[0x80]);
+    cur.seek(&[item_byte(Tag::VarRef(0))]);
     while let Some(k) = cur.key() {
-        if is_wildcard_byte(k) {
-            out.push(Cand::Wild(k[0]));
+        if is_wildcard_term(k) {
+            out.push(k.to_vec());
             cur.next();
         } else {
             break;
         }
     }
-}
-
-fn ground_candidates<Z: Zipper + ZipperMoving>(cur: &mut SubtermCursor<Z>, g: &[u8]) -> Vec<Cand> {
-    let mut out = Vec::new();
-    add_ground_matches(cur, g, &mut out);
     out
 }
 
@@ -790,7 +682,7 @@ fn split_columns(bytes: &[u8], ncols: usize) -> Vec<&[u8]> {
     let mut cols = Vec::with_capacity(ncols);
     let mut i = 0;
     for _ in 0..ncols {
-        let len = first_subterm_len(&bytes[i..]);
+        let len = expr_span_len(expr_from_bytes(&bytes[i..]));
         cols.push(&bytes[i..i + len]);
         i += len;
     }
@@ -805,25 +697,23 @@ fn columns_to_items(cols: &[&[u8]]) -> Vec<Vec<Item>> {
     let mut out = Vec::with_capacity(cols.len());
     for col in cols {
         let mut items = Vec::new();
-        let mut i = 0;
-        while i < col.len() {
-            let b = col[i];
-            i += 1;
-            match b & TOP2 {
-                TAG_ARITY => items.push(Item::Byte(b)),
-                TAG_VARREF => items.push(Item::Var((b & LOW6) as usize)),
-                _ => {
-                    if b == NEWVAR_BYTE {
-                        items.push(Item::Var(next_orig));
-                        next_orig += 1;
-                    } else {
-                        items.push(Item::Byte(b));
-                        for _ in 0..(b & LOW6) as usize {
-                            items.push(Item::Byte(col[i]));
-                            i += 1;
-                        }
-                    }
+        let mut ez = ExprZipper::new(expr_from_bytes(col));
+        loop {
+            match ez.item() {
+                Ok(Tag::Arity(arity)) => items.push(Item::Byte(item_byte(Tag::Arity(arity)))),
+                Ok(Tag::VarRef(var)) => items.push(Item::Var(var as usize)),
+                Ok(Tag::NewVar) => {
+                    items.push(Item::Var(next_orig));
+                    next_orig += 1;
                 }
+                Err(symbol) => {
+                    items.push(Item::Byte(item_byte(Tag::SymbolSize(symbol.len() as u8))));
+                    items.extend(symbol.iter().copied().map(Item::Byte));
+                }
+                Ok(Tag::SymbolSize(_)) => unreachable!(),
+            }
+            if !ez.next() {
+                break;
             }
         }
         out.push(items);
@@ -843,10 +733,10 @@ fn emit_reordered(items_by_col: &[Vec<Item>], new_order: &[usize]) -> Vec<u8> {
             match item {
                 Item::Byte(b) => out.push(*b),
                 Item::Var(orig) => match renum.get(orig) {
-                    Some(&new_id) => out.push(TAG_VARREF | new_id as u8),
+                    Some(&new_id) => out.push(item_byte(Tag::VarRef(new_id as u8))),
                     None => {
                         renum.insert(*orig, renum.len());
-                        out.push(NEWVAR_BYTE);
+                        out.push(item_byte(Tag::NewVar));
                     }
                 },
             }
@@ -860,18 +750,22 @@ fn emit_reordered(items_by_col: &[Vec<Item>], new_order: &[usize]) -> Vec<u8> {
 /// column-variable list, now non-decreasing, so the join seeks it like any compatible factor. This
 /// is the one partial materialization the cyclic case needs, and only the inverted factor pays it;
 /// re-keying into another attribute order is the standard worst-case-optimal answer to a cycle.
-fn build_reindex(map: &PathMap<()>, factor: &Factor, var_pos: &[usize]) -> (PathMap<()>, Vec<Col>) {
+fn build_reindex(
+    map: &PathMap<()>,
+    factor: &Factor,
+    var_pos: &[usize],
+) -> (PathMap<()>, Vec<FactorColumn>) {
     let ncols = factor.cols.len();
     let mut new_order: Vec<usize> = (0..ncols).collect();
     new_order.sort_by_key(|&c| match &factor.cols[c] {
-        Col::Ground(_) => (0usize, 0usize, c),
+        FactorColumn::Term(term) if term.is_ground() => (0usize, 0usize, c),
         col => (
             col.min_var_pos(var_pos).map_or(usize::MAX, |pos| pos + 1),
             1usize,
             c,
         ),
     });
-    let new_cols: Vec<Col> = new_order.iter().map(|&c| factor.cols[c].clone()).collect();
+    let new_cols: Vec<FactorColumn> = new_order.iter().map(|&c| factor.cols[c].clone()).collect();
 
     let mut reindex = PathMap::<()>::new();
     let plen = factor.prefix.len();
@@ -909,7 +803,8 @@ pub fn unify_join_zipper(
 /// resolved to a concrete term (ground or schematic) and `None` when it stayed free. Generalizes
 /// [`ground_join`]: a stored variable in the data is a wildcard that unifies with the join variable
 /// through the trail. Inverted factors (a cyclic query has one) are re-indexed up front so the join
-/// can seek them; every other factor stays zero-copy on the live map.
+/// can seek them; every other factor stays zero-copy on the live map. An assignment whose bindings
+/// close a cycle (an occurs violation built across columns) yields no row.
 pub fn unify_join_zipper_partial(
     map: &PathMap<()>,
     factors: &[Factor],
@@ -976,8 +871,9 @@ fn run_unify_join<'a>(
         nvars,
         bound: vec![Vec::new(); nf],
         next_col: vec![0; nf],
-        stored_slots: vec![Vec::new(); nf],
-        env: Env::new(nvars),
+        data_intro: vec![0; nf],
+        bindings: BTreeMap::new(),
+        arena: Vec::new(),
         out: BTreeSet::new(),
         want_coordinated,
         coordinated: BTreeSet::new(),
@@ -994,90 +890,58 @@ pub fn parse_body_factors(body: &[u8]) -> Option<(Vec<Factor>, usize)> {
     if body_len != body.len() {
         return None;
     }
-    if body.is_empty() || body[0] & TOP2 != TAG_ARITY {
+    let body_term = EncodedTerm::new(body.to_vec(), 0);
+    let body_expr = body_term.expr();
+    let nvars = validate_vars_and_count(body_expr)?;
+    let Tag::Arity(nconj) = body_term.tag() else {
         return None;
-    }
-    let nconj = (body[0] & LOW6) as usize;
+    };
     if nconj == 0 {
         return None;
     }
-    let mut i = 1;
-    i += try_parse_first_subterm(body.get(i..)?)?.0; // skip the `,` conjunction head
-    let mut factors = Vec::with_capacity(nconj - 1);
-    let mut nvars = 0usize;
-    for _ in 0..nconj - 1 {
-        let plen = try_parse_first_subterm(body.get(i..)?)?.0;
-        factors.push(parse_pattern_factor(&body[i..i + plen], &mut nvars)?);
-        i += plen;
-    }
-    if i != body.len() {
+    let children = expr_children(&body_term)?;
+    if children.len() != nconj as usize {
         return None;
+    }
+    let mut factors = Vec::with_capacity(nconj.saturating_sub(1) as usize);
+    for factor in children.iter().skip(1) {
+        factors.push(parse_pattern_factor(factor)?);
     }
     Some((factors, nvars))
 }
 
 /// One conjunct `(rel arg..)` to a factor. The prefix is the arity byte and relation symbol only.
 /// Each argument becomes a query variable, a ground subterm, or a recursive compound pattern.
-fn parse_pattern_factor(pat: &[u8], nvars: &mut usize) -> Option<Factor> {
-    if pat.is_empty() || pat[0] & TOP2 != TAG_ARITY {
+fn parse_pattern_factor(pat: &EncodedTerm) -> Option<Factor> {
+    let Tag::Arity(total_arity) = pat.tag() else {
+        return None;
+    };
+    if total_arity == 0 {
         return None;
     }
-    let mut args_left = (pat[0] & LOW6) as usize;
-    if args_left == 0 {
+    let children = expr_children(pat)?;
+    if children.len() != total_arity as usize {
         return None;
     }
-    args_left -= 1;
-    let mut j = 1 + try_parse_first_subterm(pat.get(1..)?)?.0; // past the arity byte and the head symbol
-    let prefix = pat[0..j].to_vec();
-    let mut cols = Vec::with_capacity(args_left);
-    while args_left > 0 {
-        let len = try_parse_first_subterm(pat.get(j..)?)?.0;
-        cols.push(parse_pattern_col(&pat[j..j + len], nvars)?);
-        j += len;
-        args_left -= 1;
-    }
-    if j != pat.len() {
-        return None;
+    let head = children.first()?;
+    let mut prefix = vec![item_byte(Tag::Arity(total_arity))];
+    prefix.extend_from_slice(&head.bytes);
+    let mut cols = Vec::with_capacity(total_arity.saturating_sub(1) as usize);
+    for child in children.iter().skip(1) {
+        cols.push(parse_pattern_col(child)?);
     }
     Some(Factor { prefix, cols })
 }
 
-fn parse_pattern_col(bytes: &[u8], nvars: &mut usize) -> Option<Col> {
-    if bytes.is_empty() {
-        return None;
+fn parse_pattern_col(term: &EncodedTerm) -> Option<FactorColumn> {
+    if term.bytes.len() == 1 {
+        match term.tag() {
+            Tag::NewVar => return Some(FactorColumn::Var(term.intro as usize)),
+            Tag::VarRef(id) => return Some(FactorColumn::Var(id as usize)),
+            Tag::SymbolSize(_) | Tag::Arity(_) => {}
+        }
     }
-    let b = bytes[0];
-    if bytes.len() == 1 && (0x80..=0xC0).contains(&b) {
-        return Some(Col::Var(if b == NEWVAR_BYTE {
-            let id = *nvars;
-            *nvars += 1;
-            id
-        } else {
-            let id = (b & LOW6) as usize;
-            if id >= *nvars {
-                return None;
-            }
-            id
-        }));
-    }
-    if first_subterm_is_ground(bytes) {
-        return Some(Col::Ground(bytes.to_vec()));
-    }
-    if b & TOP2 != TAG_ARITY {
-        return None;
-    }
-    let arity = (b & LOW6) as usize;
-    let mut children = Vec::with_capacity(arity);
-    let mut pos = 1usize;
-    for _ in 0..arity {
-        let len = try_parse_first_subterm(bytes.get(pos..)?)?.0;
-        children.push(parse_pattern_col(&bytes[pos..pos + len], nvars)?);
-        pos += len;
-    }
-    if pos != bytes.len() {
-        return None;
-    }
-    Some(Col::Compound(Box::new(CompoundPat { arity: b, children })))
+    Some(FactorColumn::Term(term.clone()))
 }
 
 /// Live-route entry: parse the conjunction body into factors and run the join on the live map.
@@ -1159,7 +1023,9 @@ pub fn unify_join_zipper_body_rows_rendered(
             return None;
         }
         let var_order: Vec<usize> = (0..nvars).collect();
-        Some(unify_join_zipper_coordinated(map, &factors, &var_order, nvars))
+        Some(unify_join_zipper_coordinated(
+            map, &factors, &var_order, nvars,
+        ))
     }))
     .ok()
     .flatten()
@@ -1170,7 +1036,7 @@ fn body_factors_routable_to_zipper_join(map: &PathMap<()>, factors: &[Factor]) -
         let compound_count = factor
             .cols
             .iter()
-            .filter(|col| matches!(col, Col::Compound(_)))
+            .filter(|col| col.is_nonground_compound())
             .count();
         if compound_count > 1 {
             return false;
@@ -1204,12 +1070,7 @@ fn fact_routable_for_factor(factor: &Factor, fact: &[u8], factor_count: usize) -
             return false;
         }
     }
-    if factor_count > 1
-        && factor
-            .cols
-            .iter()
-            .any(|col| matches!(col, Col::Compound(_)))
-    {
+    if factor_count > 1 && factor.cols.iter().any(FactorColumn::is_nonground_compound) {
         let Some(has_varref) = expr_has_varref(fact) else {
             return false;
         };
@@ -1224,7 +1085,7 @@ fn try_split_columns(bytes: &[u8], ncols: usize) -> Option<Vec<&[u8]>> {
     let mut cols = Vec::with_capacity(ncols);
     let mut pos = 0usize;
     for _ in 0..ncols {
-        let len = try_parse_first_subterm(bytes.get(pos..)?)?.0;
+        let len = expr_span_len(expr_from_bytes(bytes.get(pos..)?));
         cols.push(bytes.get(pos..pos + len)?);
         pos += len;
     }
@@ -1232,16 +1093,13 @@ fn try_split_columns(bytes: &[u8], ncols: usize) -> Option<Vec<&[u8]>> {
 }
 
 fn subterm_is_nonground_compound(bytes: &[u8]) -> bool {
-    bytes.first().is_some_and(|b| {
-        b & TOP2 == TAG_ARITY && !try_parse_first_subterm(bytes).is_some_and(|(_, ground)| ground)
+    bytes.first().is_some_and(|&b| {
+        matches!(byte_item(b), Tag::Arity(_)) && !expr_is_ground(expr_from_bytes(bytes))
     })
 }
 
-fn ground_query_column_can_absorb(col: &Col) -> bool {
-    match col {
-        Col::Ground(_) | Col::Compound(_) => true,
-        Col::Var(_) => false,
-    }
+fn ground_query_column_can_absorb(col: &FactorColumn) -> bool {
+    matches!(col, FactorColumn::Term(_))
 }
 
 fn expr_has_varref(bytes: &[u8]) -> Option<bool> {
@@ -1249,27 +1107,15 @@ fn expr_has_varref(bytes: &[u8]) -> Option<bool> {
     if len != bytes.len() {
         return None;
     }
-    let mut i = 0usize;
-    let mut remaining = 1usize;
-    while remaining > 0 {
-        let b = *bytes.get(i)?;
-        i += 1;
-        remaining -= 1;
-        match b & TOP2 {
-            TAG_ARITY => remaining += (b & LOW6) as usize,
-            TAG_VARREF => return Some(true),
-            _ => {
-                if b != NEWVAR_BYTE {
-                    let payload = (b & LOW6) as usize;
-                    i = i.checked_add(payload)?;
-                    if i > bytes.len() {
-                        return None;
-                    }
-                }
-            }
+    let mut ez = ExprZipper::new(expr_from_bytes(bytes));
+    loop {
+        if matches!(ez.tag(), Tag::VarRef(_)) {
+            return Some(true);
+        }
+        if !ez.next() {
+            return Some(false);
         }
     }
-    (i == bytes.len()).then_some(false)
 }
 
 struct UnifyJoin<'a> {
@@ -1285,8 +1131,9 @@ struct UnifyJoin<'a> {
     nvars: usize,
     bound: Vec<Vec<u8>>,
     next_col: Vec<usize>,
-    stored_slots: Vec<Vec<usize>>,
-    env: Env,
+    data_intro: Vec<u8>,
+    bindings: Bindings,
+    arena: Vec<Box<[u8]>>,
     /// Answer rows, one `Option` per query variable: `Some(bytes)` for a resolved term, `None` for
     /// a still-free variable. The all-ground entry filters to fully-ground rows.
     out: BTreeSet<Vec<Option<Vec<u8>>>>,
@@ -1310,12 +1157,22 @@ impl UnifyJoin<'_> {
             // Keep every component that resolved to a term, ground or schematic. A variable that is
             // still free is None; the live emit can then render schematic compounds and leave free
             // variables fresh, matching the ProductZipper's byte output.
-            let row: Vec<Option<Vec<u8>>> =
-                (0..self.nvars).map(|v| self.env.term_bytes_of(v)).collect();
+            //
+            // `mork_expr::unify` checks occurs only per equation, so a cycle can arrive through a
+            // chain of columns (the join-propagated capture builds x0 = (k (k x0))). `apply`
+            // records in `cycled` every variable whose cycle it had to cut; `Expr::_unify` rejects
+            // exactly that after its own apply. Mirror it per answer row: a cyclic assignment is an
+            // occurs violation and yields no answer, as the ProductZipper's full unification does.
+            let mut cycled = BTreeMap::new();
+            let row: Vec<Option<Vec<u8>>> = (0..self.nvars)
+                .map(|v| self.query_component(v, &mut cycled))
+                .collect();
+            if !cycled.is_empty() {
+                return;
+            }
             self.out.insert(row);
             if self.want_coordinated {
-                self.coordinated
-                    .insert(self.env.encode_tuple_coordinated(self.nvars));
+                self.coordinated.insert(self.emit_coordinated_tuple());
             }
             return;
         }
@@ -1323,15 +1180,15 @@ impl UnifyJoin<'_> {
         let mut parts: Vec<usize> = (0..self.factors.len())
             .filter(|&f| {
                 let nc = self.next_col[f];
-                matches!(self.factors[f].cols.get(nc), Some(Col::Var(cv)) if *cv == v)
+                matches!(self.factors[f].cols.get(nc), Some(FactorColumn::Var(cv)) if *cv == v)
             })
             .collect();
         if parts.is_empty() {
             self.recurse(i + 1);
             return;
         }
-        if !matches!(self.env.resolve_term(&Col::Var(v)), Col::Var(_)) {
-            self.consume_bound_var_parts(&parts, 0, v, i);
+        if self.deref_env(self.query_var_env(v)).var_opt().is_none() {
+            self.consume_var_parts(&parts, 0, v, i);
             return;
         }
         // The leapfrog principle: lead with the smallest domain so the leading factor enumerates
@@ -1339,14 +1196,9 @@ impl UnifyJoin<'_> {
         // position is the estimate. This is what makes a selective factor, say (e a $y) with a few
         // edges, drive the join instead of the whole relation.
         parts.sort_by_key(|&f| self.domain_estimate(f));
-        self.intersect_unify(&parts, 0, v, i);
+        self.consume_var_parts(&parts, 0, v, i);
     }
 
-    /// Domain-size estimate for lead selection, bounded so it is independent of the space size.
-    /// Count the distinct subterm values under the factor's current position, but stop at a small
-    /// cap. The leapfrog only needs to know which factor has the fewest candidates, not the exact
-    /// count, so a bounded count suffices and stays O(cap). A full `val_count` is O(subtree), which
-    /// would make a selective join's cost climb with the whole relation rather than the answer.
     /// The map factor `f` reads from: its re-indexed copy if it was inverted, else the live map.
     fn src_map(&self, f: usize) -> &PathMap<()> {
         match self.factor_src[f] {
@@ -1355,6 +1207,11 @@ impl UnifyJoin<'_> {
         }
     }
 
+    /// Domain-size estimate for lead selection, bounded so it is independent of the space size.
+    /// Count the distinct subterm values under the factor's current position, but stop at a small
+    /// cap. The leapfrog only needs to know which factor has the fewest candidates, not the exact
+    /// count, so a bounded count suffices and stays O(cap). A full `val_count` is O(subtree), which
+    /// would make a selective join's cost climb with the whole relation rather than the answer.
     fn domain_estimate(&self, f: usize) -> usize {
         const CAP: usize = 32;
         let mut path = self.factors[f].prefix.clone();
@@ -1384,7 +1241,7 @@ impl UnifyJoin<'_> {
     }
 
     /// The candidates at factor `f`'s current column when a query variable is still free.
-    fn open_free_candidates(&self, f: usize) -> Vec<Cand> {
+    fn open_free_candidates(&self, f: usize) -> Vec<Vec<u8>> {
         let path = self.factor_path(f);
         let mut cur = SubtermCursor::new(self.src_map(f).read_zipper_at_path(&path));
         free_candidates(&mut cur)
@@ -1393,7 +1250,7 @@ impl UnifyJoin<'_> {
     /// The candidates at factor `f`'s current ground column that can unify with the fixed query
     /// value. A data-side wildcard captures that ground value and keeps its stored slot for later
     /// VarRef columns in the same fact.
-    fn open_ground_candidates(&self, f: usize, ground: &[u8]) -> Vec<Cand> {
+    fn open_ground_candidates(&self, f: usize, ground: &[u8]) -> Vec<Vec<u8>> {
         let path = self.factor_path(f);
         let mut cur = SubtermCursor::new(self.src_map(f).read_zipper_at_path(&path));
         ground_candidates(&mut cur, ground)
@@ -1411,7 +1268,7 @@ impl UnifyJoin<'_> {
     fn wildcard_children_at_current(&self, f: usize) -> Vec<u8> {
         self.child_bytes_at_current(f)
             .into_iter()
-            .filter(|&b| (0x80..=0xC0).contains(&b))
+            .filter(|&b| is_wildcard_term(&[b]))
             .collect()
     }
 
@@ -1420,104 +1277,196 @@ impl UnifyJoin<'_> {
         has_bit(&self.src_map(f).read_zipper_at_path(&path).child_mask(), b)
     }
 
-    /// Unify `qvar` with a candidate child of factor `f`, returning whether it held and the trie
-    /// bytes to descend. A NewVar wildcard allocates a fresh stored variable (pushed to `f`'s slots
-    /// so a later VarRef in the same fact corefers); a VarRef reads the slot it introduced.
-    fn apply_cand(&mut self, qvar: usize, cand: &Cand, f: usize) -> (bool, Vec<u8>) {
-        match cand {
-            Cand::Ground(g) => {
-                let term = self.data_term_from_bytes(f, g);
-                (self.env.unify_var_term(qvar, &term), g.clone())
-            }
-            Cand::Wild(w) => {
-                let id = self.stored_var_for_wildcard(f, *w);
-                (self.env.unify_var_var(qvar, id), vec![*w])
-            }
+    fn factor_namespace(&self, f: usize) -> u8 {
+        1 + f as u8
+    }
+
+    fn query_var_env(&self, v: usize) -> ExprEnv {
+        ExprEnv {
+            n: QUERY_NS,
+            v: v as u8,
+            offset: 0,
+            base: expr_from_bytes(&NEW_VAR_EXPR_BYTES),
         }
     }
 
-    fn stored_var_for_wildcard(&mut self, f: usize, w: u8) -> usize {
-        if w == 0xC0 {
-            let id = self.env.fresh();
-            self.stored_slots[f].push(id);
-            id
+    fn var_env(&self, (n, v): BindingKey) -> ExprEnv {
+        ExprEnv {
+            n,
+            v,
+            offset: 0,
+            base: expr_from_bytes(&NEW_VAR_EXPR_BYTES),
+        }
+    }
+
+    fn arena_env(&mut self, namespace: u8, intro: u8, bytes: &[u8]) -> ExprEnv {
+        self.arena.push(bytes.to_vec().into_boxed_slice());
+        let bytes = self.arena.last().unwrap();
+        ExprEnv {
+            n: namespace,
+            v: intro,
+            offset: 0,
+            base: expr_from_bytes(bytes),
+        }
+    }
+
+    fn data_env_for(&mut self, f: usize, bytes: &[u8]) -> ExprEnv {
+        self.arena_env(self.factor_namespace(f), self.data_intro[f], bytes)
+    }
+
+    fn unified_bindings(&self, lhs: ExprEnv, rhs: ExprEnv) -> Option<Bindings> {
+        let mut pairs = Vec::with_capacity(self.bindings.len() + 1);
+        for (&var, &env) in &self.bindings {
+            pairs.push((self.var_env(var), env));
+        }
+        pairs.push((lhs, rhs));
+        unify(&mut pairs).ok()
+    }
+
+    fn deref_env(&self, env: ExprEnv) -> ExprEnv {
+        let mut current = env;
+        loop {
+            let Some(var) = current.var_opt() else {
+                return current;
+            };
+            let Some(bound) = self.bindings.get(&var) else {
+                return current;
+            };
+            current = *bound;
+        }
+    }
+
+    fn query_component(&self, v: usize, cycled: &mut BTreeMap<BindingKey, u8>) -> Option<Vec<u8>> {
+        let env = self.query_var_env(v);
+        if self.deref_env(env).var_opt().is_some() {
+            None
         } else {
-            self.stored_slots[f][(w & 0x3F) as usize]
+            Some(self.emit_env_bytes(env, cycled))
         }
     }
 
-    fn apply_ground_cand(&mut self, ground: &[u8], cand: &Cand, f: usize) -> (bool, Vec<u8>) {
-        match cand {
-            Cand::Ground(g) => (g == ground, g.clone()),
-            Cand::Wild(w) => {
-                let id = self.stored_var_for_wildcard(f, *w);
-                (self.env.unify_var_ground(id, ground), vec![*w])
-            }
+    fn applied_var_len(&self, key: BindingKey, stack: &mut Vec<BindingKey>) -> usize {
+        let Some(bound) = self.bindings.get(&key) else {
+            return 1;
+        };
+        if stack.contains(&key) {
+            return 1;
         }
+        stack.push(key);
+        let len = self.applied_len_inner(*bound, stack);
+        stack.pop();
+        len
     }
 
-    fn data_term_from_bytes(&mut self, f: usize, bytes: &[u8]) -> Col {
-        let mut pos = 0usize;
-        let term = self.parse_data_term_at(f, bytes, &mut pos);
-        debug_assert_eq!(pos, bytes.len());
-        term
-    }
-
-    fn parse_data_term_at(&mut self, f: usize, bytes: &[u8], pos: &mut usize) -> Col {
-        let start = *pos;
-        let b = bytes[*pos];
-        *pos += 1;
-        match b & TOP2 {
-            TAG_ARITY => {
-                let arity = (b & LOW6) as usize;
-                let mut children = Vec::with_capacity(arity);
-                for _ in 0..arity {
-                    children.push(self.parse_data_term_at(f, bytes, pos));
+    fn applied_len_inner(&self, env: ExprEnv, stack: &mut Vec<BindingKey>) -> usize {
+        let mut ez = ExprZipper::new(env.subsexpr());
+        let mut original = env.v;
+        let mut len = 0usize;
+        loop {
+            match ez.item() {
+                Ok(Tag::NewVar) => {
+                    len += self.applied_var_len((env.n, original), stack);
+                    original += 1;
                 }
-                if children.iter().all(|child| matches!(child, Col::Ground(_))) {
-                    Col::Ground(bytes[start..*pos].to_vec())
-                } else {
-                    Col::Compound(Box::new(CompoundPat { arity: b, children }))
-                }
+                Ok(Tag::VarRef(i)) => len += self.applied_var_len((env.n, i), stack),
+                Ok(Tag::Arity(_)) => len += 1,
+                Ok(Tag::SymbolSize(_)) => unreachable!(),
+                Err(symbol) => len += 1 + symbol.len(),
             }
-            TAG_VARREF => Col::Var(self.stored_var_for_wildcard(f, b)),
-            _ if b == NEWVAR_BYTE => Col::Var(self.stored_var_for_wildcard(f, b)),
-            _ => {
-                let len = (b & LOW6) as usize;
-                *pos += len;
-                Col::Ground(bytes[start..*pos].to_vec())
+            if !ez.next() {
+                return len;
             }
         }
     }
 
-    fn intersect_unify(&mut self, parts: &[usize], pi: usize, v: usize, i: usize) {
+    fn applied_len(&self, env: ExprEnv) -> usize {
+        self.applied_len_inner(env, &mut Vec::new())
+    }
+
+    #[allow(deprecated)]
+    fn apply_env_into(
+        &self,
+        env: ExprEnv,
+        new_intros: u8,
+        out: &mut Vec<u8>,
+        cycled: &mut BTreeMap<BindingKey, u8>,
+        stack: &mut Vec<BindingKey>,
+        assignments: &mut Vec<BindingKey>,
+    ) -> u8 {
+        let len = self.applied_len(env).max(1);
+        let start = out.len();
+        out.resize(start + len, 0);
+        let mut ez = ExprZipper::new(env.subsexpr());
+        let mut oz = ExprZipper::new(Expr {
+            ptr: out[start..].as_mut_ptr(),
+        });
+        let (_, next_new) = mork_expr::apply(
+            env.n,
+            env.v,
+            new_intros,
+            &mut ez,
+            &self.bindings,
+            &mut oz,
+            cycled,
+            stack,
+            assignments,
+        );
+        debug_assert!(
+            oz.loc <= len,
+            "apply wrote {} bytes into a buffer sized {} by applied_len",
+            oz.loc,
+            len
+        );
+        out.truncate(start + oz.loc);
+        next_new
+    }
+
+    fn emit_env_bytes(&self, env: ExprEnv, cycled: &mut BTreeMap<BindingKey, u8>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut stack = Vec::new();
+        let mut assignments = Vec::new();
+        self.apply_env_into(env, 0, &mut out, cycled, &mut stack, &mut assignments);
+        out
+    }
+
+    fn emit_coordinated_tuple(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cycled = BTreeMap::new();
+        let mut stack = Vec::new();
+        let mut assignments = Vec::new();
+        let mut new_intros = 0;
+        for v in 0..self.nvars {
+            new_intros = self.apply_env_into(
+                self.query_var_env(v),
+                new_intros,
+                &mut out,
+                &mut cycled,
+                &mut stack,
+                &mut assignments,
+            );
+        }
+        out
+    }
+
+    /// Consume variable `v`'s column in each participating factor in turn, then move to the next
+    /// scheduled variable. The lead factor (`pi == 0`, `v` still free) enumerates its small domain
+    /// and binds `v`; every later factor SEEKS the now-bound `v` instead of enumerating its own
+    /// relation. `consume_col` resolves `v` and does exactly that: it enumerates while `v` is free
+    /// and seeks once it is bound (a data-side wildcard still captures the value); when `v` was
+    /// already bound by an earlier level, every factor seeks. The seek is what keeps a k-factor
+    /// join O(answer) rather than O(relation^k); enumerating every factor made the triangle O(s^2).
+    fn consume_var_parts(&mut self, parts: &[usize], pi: usize, v: usize, i: usize) {
         if pi == parts.len() {
             self.recurse(i + 1);
             return;
         }
-        // The lead factor (pi == 0, `v` still free) enumerates its small domain and binds `v`; every
-        // later factor SEEKS the now-bound `v` instead of enumerating its own relation. `consume_col`
-        // resolves `v` and does exactly that: it enumerates while `v` is free and seeks once it is
-        // bound (a data-side wildcard still captures the value). The seek is what keeps a k-factor
-        // join O(answer) rather than O(relation^k); enumerating every factor made the triangle O(s^2).
         let f = parts[pi];
-        self.consume_col(f, Col::Var(v), &mut |this| {
-            this.intersect_unify(parts, pi + 1, v, i);
+        self.consume_col(f, FactorColumn::Var(v), &mut |this| {
+            this.consume_var_parts(parts, pi + 1, v, i);
         });
     }
 
-    fn consume_bound_var_parts(&mut self, parts: &[usize], pi: usize, v: usize, i: usize) {
-        if pi == parts.len() {
-            self.recurse(i + 1);
-            return;
-        }
-        let f = parts[pi];
-        self.consume_col(f, Col::Var(v), &mut |this| {
-            this.consume_bound_var_parts(parts, pi + 1, v, i);
-        });
-    }
-
-    fn consume_col(&mut self, f: usize, col: Col, cont: &mut dyn FnMut(&mut Self)) {
+    fn consume_col(&mut self, f: usize, col: FactorColumn, cont: &mut dyn FnMut(&mut Self)) {
         self.match_col_at_current(f, col, &mut |this| {
             this.next_col[f] += 1;
             cont(this);
@@ -1525,76 +1474,113 @@ impl UnifyJoin<'_> {
         });
     }
 
-    fn with_bound_bytes(&mut self, f: usize, bytes: &[u8], cont: &mut dyn FnMut(&mut Self)) {
+    fn with_bound_path_bytes(
+        &mut self,
+        f: usize,
+        bytes: &[u8],
+        intro_delta: u8,
+        cont: &mut dyn FnMut(&mut Self),
+    ) {
         let len = self.bound[f].len();
+        let intro = self.data_intro[f];
         self.bound[f].extend_from_slice(bytes);
+        self.data_intro[f] += intro_delta;
         cont(self);
+        self.data_intro[f] = intro;
         self.bound[f].truncate(len);
     }
 
-    fn match_col_at_current(&mut self, f: usize, col: Col, cont: &mut dyn FnMut(&mut Self)) {
-        match self.env.resolve_term(&col).structural_ground() {
-            Col::Var(qvar) => {
-                let cands = self.open_free_candidates(f);
-                for cand in cands {
-                    let mark = self.env.mark();
-                    let slots_len = self.stored_slots[f].len();
-                    let (ok, bytes) = self.apply_cand(qvar, &cand, f);
-                    if ok {
-                        self.with_bound_bytes(f, &bytes, cont);
-                    }
-                    self.stored_slots[f].truncate(slots_len);
-                    self.env.rollback(mark);
-                }
-            }
-            Col::Ground(g) => self.match_ground_at_current(f, &g, cont),
-            Col::Compound(compound) => self.match_compound_at_current(f, *compound, cont),
-        }
+    fn with_bound_term(&mut self, f: usize, bytes: &[u8], cont: &mut dyn FnMut(&mut Self)) {
+        let intro_delta = expr_from_bytes(bytes).newvars() as u8;
+        self.with_bound_path_bytes(f, bytes, intro_delta, cont);
     }
 
-    fn match_ground_at_current(
+    fn match_col_at_current(
         &mut self,
         f: usize,
-        ground: &[u8],
+        col: FactorColumn,
         cont: &mut dyn FnMut(&mut Self),
     ) {
-        if !ground.is_empty() && ground[0] & TOP2 == TAG_ARITY {
-            self.match_compound_at_current(f, compound_from_ground_bytes(ground), cont);
+        let env = match col {
+            FactorColumn::Var(v) => self.query_var_env(v),
+            FactorColumn::Term(term) => self.arena_env(QUERY_NS, term.intro, &term.bytes),
+        };
+        self.match_expr_at_current(f, env, cont);
+    }
+
+    fn match_candidate(
+        &mut self,
+        f: usize,
+        pattern: ExprEnv,
+        bytes: &[u8],
+        cont: &mut dyn FnMut(&mut Self),
+    ) {
+        let saved_bindings = self.bindings.clone();
+        let arena_mark = self.arena.len();
+        let data_env = self.data_env_for(f, bytes);
+        if let Some(bindings) = self.unified_bindings(pattern, data_env) {
+            self.bindings = bindings;
+            self.with_bound_term(f, bytes, cont);
+        }
+        self.bindings = saved_bindings;
+        self.arena.truncate(arena_mark);
+    }
+
+    fn match_expr_at_current(
+        &mut self,
+        f: usize,
+        pattern: ExprEnv,
+        cont: &mut dyn FnMut(&mut Self),
+    ) {
+        let resolved = self.deref_env(pattern);
+        if resolved.var_opt().is_some() {
+            for bytes in self.open_free_candidates(f) {
+                self.match_candidate(f, pattern, &bytes, cont);
+            }
             return;
         }
-        let cands = self.open_ground_candidates(f, ground);
-        for cand in cands {
-            let mark = self.env.mark();
-            let slots_len = self.stored_slots[f].len();
-            let (ok, bytes) = self.apply_ground_cand(ground, &cand, f);
-            if ok {
-                self.with_bound_bytes(f, &bytes, cont);
+        match byte_item(unsafe { *resolved.subsexpr().ptr }) {
+            Tag::Arity(_) => self.match_compound_at_current(f, pattern, resolved, cont),
+            Tag::NewVar | Tag::VarRef(_) => unreachable!(),
+            Tag::SymbolSize(_) => {
+                // A symbol holds no variables, so the resolved value needs no substitution: its
+                // bytes are the subexpression span itself. `apply` stays for compound values.
+                let bytes = unsafe { resolved.subsexpr().span().as_ref().unwrap() }.to_vec();
+                for candidate in self.open_ground_candidates(f, &bytes) {
+                    // Ground against ground: the seek established byte equality, and on ground
+                    // terms byte equality is unifiability (RoutingSafe.thy,
+                    // `ground_unifiable_iff_eq`), so `unify` would return the bindings unchanged.
+                    // Bind the column directly; a wildcard candidate still unifies through
+                    // `mork_expr::unify` below.
+                    if candidate == bytes {
+                        self.with_bound_path_bytes(f, &candidate, 0, cont);
+                    } else {
+                        self.match_candidate(f, pattern, &candidate, cont);
+                    }
+                }
             }
-            self.stored_slots[f].truncate(slots_len);
-            self.env.rollback(mark);
         }
     }
 
     fn match_compound_at_current(
         &mut self,
         f: usize,
-        compound: CompoundPat,
+        pattern: ExprEnv,
+        resolved: ExprEnv,
         cont: &mut dyn FnMut(&mut Self),
     ) {
-        let capture_term = Col::Compound(Box::new(compound.clone()));
         for w in self.wildcard_children_at_current(f) {
-            let mark = self.env.mark();
-            let slots_len = self.stored_slots[f].len();
-            let id = self.stored_var_for_wildcard(f, w);
-            if self.env.unify_var_term(id, &capture_term) {
-                self.with_bound_bytes(f, &[w], cont);
-            }
-            self.stored_slots[f].truncate(slots_len);
-            self.env.rollback(mark);
+            self.match_candidate(f, pattern, &[w], cont);
         }
-        if self.child_exists_at_current(f, compound.arity) {
-            self.with_bound_bytes(f, &[compound.arity], &mut |this| {
-                this.match_compound_children(f, &compound.children, 0, cont);
+        let Some(arity) = resolved.subsexpr().arity() else {
+            return;
+        };
+        let arity_byte = item_byte(Tag::Arity(arity));
+        if self.child_exists_at_current(f, arity_byte) {
+            let mut children = Vec::new();
+            resolved.args(&mut children);
+            self.with_bound_path_bytes(f, &[arity_byte], 0, &mut |this| {
+                this.match_compound_children(f, &children, 0, cont);
             });
         }
     }
@@ -1602,7 +1588,7 @@ impl UnifyJoin<'_> {
     fn match_compound_children(
         &mut self,
         f: usize,
-        children: &[Col],
+        children: &[ExprEnv],
         idx: usize,
         cont: &mut dyn FnMut(&mut Self),
     ) {
@@ -1610,8 +1596,8 @@ impl UnifyJoin<'_> {
             cont(self);
             return;
         }
-        let child = children[idx].clone();
-        self.match_col_at_current(f, child, &mut |this| {
+        let child = children[idx];
+        self.match_expr_at_current(f, child, &mut |this| {
             this.match_compound_children(f, children, idx + 1, cont);
         });
     }
@@ -1630,10 +1616,10 @@ impl UnifyJoin<'_> {
             return;
         };
         match col {
-            Col::Var(vp) if self.var_pos[vp] < i => {
-                self.consume_col(f, Col::Var(vp), &mut |this| this.catch_up(i, f));
+            FactorColumn::Var(vp) if self.var_pos[vp] < i => {
+                self.consume_col(f, FactorColumn::Var(vp), &mut |this| this.catch_up(i, f));
             }
-            Col::Var(_) => {
+            FactorColumn::Var(_) => {
                 self.catch_up(i, f + 1);
             }
             other => {
@@ -1656,14 +1642,14 @@ mod tests {
     }
 
     fn sym(s: &str) -> Vec<u8> {
-        let mut v = vec![TAG_SYMSIZE | s.len() as u8];
+        let mut v = vec![item_byte(Tag::SymbolSize(s.len() as u8))];
         v.extend_from_slice(s.as_bytes());
         v
     }
 
     /// `(rel a0 a1 ...)` encoded: Arity(1+n), Sym(rel), then each arg's bytes.
     fn nest(rel: &str, args: &[Vec<u8>]) -> Vec<u8> {
-        let mut v = vec![TAG_ARITY | (1 + args.len()) as u8];
+        let mut v = vec![item_byte(Tag::Arity((1 + args.len()) as u8))];
         v.extend(sym(rel));
         for a in args {
             v.extend_from_slice(a);
@@ -1676,16 +1662,16 @@ mod tests {
     }
 
     fn new_var() -> Vec<u8> {
-        vec![NEWVAR_BYTE]
+        vec![item_byte(Tag::NewVar)]
     }
 
     fn var_ref(idx: u8) -> Vec<u8> {
-        vec![TAG_VARREF | idx]
+        vec![item_byte(Tag::VarRef(idx))]
     }
 
     /// The stored-path prefix for a relation of the given total arity (head + args).
     fn relation_prefix(rel: &str, total_arity: usize) -> Vec<u8> {
-        let mut v = vec![TAG_ARITY | total_arity as u8];
+        let mut v = vec![item_byte(Tag::Arity(total_arity as u8))];
         v.extend(sym(rel));
         v
     }
@@ -1702,6 +1688,17 @@ mod tests {
 
         let rows = unify_join_zipper_body_safe(&map, &body).expect("flat body routes");
         let expected = BTreeSet::from([vec![sym("a"), sym("b"), sym("c")]]);
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn safe_body_routes_single_ground_answer() {
+        let mut map = PathMap::<()>::new();
+        map.insert(&nest("p", &[sym("a"), sym("b")]), ());
+        let body = conj(&[nest("p", &[sym("a"), new_var()])]);
+
+        let rows = unify_join_zipper_body_safe(&map, &body).expect("flat body routes");
+        let expected = BTreeSet::from([vec![sym("b")]]);
         assert_eq!(rows, expected);
     }
 
@@ -1735,10 +1732,14 @@ mod tests {
         coref.insert(&nest("e", &[new_var(), var_ref(0)]), ()); // (e $u $u)
         let body = conj(&[nest("e", &[new_var(), new_var()])]); // (e $x $y)
         let rows = unify_join_zipper_body_rows_rendered(&coref, &body).expect("flat body routes");
-        assert_eq!(rows.len(), 1, "one answer: $x and $y are the same free variable");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one answer: $x and $y are the same free variable"
+        );
         assert_eq!(
             rows.iter().next().unwrap(),
-            &vec![NEWVAR_BYTE, TAG_VARREF | 0],
+            &vec![item_byte(Tag::NewVar), item_byte(Tag::VarRef(0))],
             "coreferent free variables must coordinate to NewVar, VarRef(0)"
         );
 
@@ -1749,7 +1750,7 @@ mod tests {
             unify_join_zipper_body_rows_rendered(&indep, &body).expect("flat body routes");
         assert_eq!(
             indep_rows.iter().next().unwrap(),
-            &vec![NEWVAR_BYTE, NEWVAR_BYTE],
+            &vec![item_byte(Tag::NewVar), item_byte(Tag::NewVar)],
             "independent free variables must stay distinct NewVars"
         );
     }
@@ -1813,6 +1814,36 @@ mod tests {
                 "{name} must decline safely"
             );
         }
+    }
+
+    #[test]
+    fn cyclic_capture_assignment_yields_no_row() {
+        // The join-propagated capture can close a cycle across columns: matching (e $s1 $s1) at
+        // both e-factors builds x1 = (k x0) and x2 = (k (k x0)), then (h $s0 $s0) forces x2 = x0,
+        // an occurs violation. `mork_expr::unify` checks occurs per equation, so the cycle only
+        // surfaces at the answer emit, where the row must be dropped: the ProductZipper's full
+        // unification returns exactly the three ground rows. Pins the raw partial entry beyond
+        // the router, which declines this body (the boundary test above).
+        let mut map = PathMap::<()>::new();
+        map.insert(&nest("e", &[nest("k", &[new_var()]), sym("v0")]), ());
+        map.insert(&nest("e", &[new_var(), var_ref(0)]), ());
+        map.insert(&nest("h", &[new_var(), var_ref(0)]), ());
+        map.insert(&nest("h", &[sym("junk"), sym("junk")]), ());
+        let body = conj(&[
+            nest("e", &[nest("k", &[new_var()]), new_var()]),
+            nest("e", &[nest("k", &[var_ref(1)]), new_var()]),
+            nest("h", &[var_ref(2), var_ref(0)]),
+        ]);
+        let (factors, nvars) = parse_body_factors(&body).expect("body parses");
+        let order: Vec<usize> = (0..nvars).collect();
+        let rows = unify_join_zipper_partial(&map, &factors, &order, nvars);
+        let k_v0 = nest("k", &[sym("v0")]);
+        let expected: BTreeSet<Vec<Option<Vec<u8>>>> = BTreeSet::from([
+            vec![Some(k_v0.clone()), Some(sym("v0")), Some(k_v0.clone())],
+            vec![Some(sym("v0")), Some(k_v0), Some(sym("v0"))],
+            vec![Some(sym("v0")), Some(sym("v0")), Some(sym("v0"))],
+        ]);
+        assert_eq!(rows, expected, "a cyclic assignment must yield no row");
     }
 
     #[test]
@@ -1909,14 +1940,14 @@ mod tests {
         const ALPHA: &[u8] = b"ab";
         if depth == 0 || rng.below(3) != 0 {
             let len = 1 + rng.below(3);
-            let mut v = vec![TAG_SYMSIZE | len as u8];
+            let mut v = vec![item_byte(Tag::SymbolSize(len as u8))];
             for _ in 0..len {
                 v.push(ALPHA[rng.below(ALPHA.len())]);
             }
             v
         } else {
             let n = 1 + rng.below(2);
-            let mut v = vec![TAG_ARITY | (1 + n) as u8];
+            let mut v = vec![item_byte(Tag::Arity((1 + n) as u8))];
             v.extend(sym("f"));
             for _ in 0..n {
                 v.extend(rand_term(rng, depth - 1));
@@ -1988,13 +2019,13 @@ mod tests {
             let mut ok = true;
             for (ci, col) in factors[f].cols.iter().enumerate() {
                 match col {
-                    Col::Ground(g) => {
-                        if g != &row[ci] {
+                    FactorColumn::Term(term) if term.is_ground() => {
+                        if term.bytes != row[ci] {
                             ok = false;
                             break;
                         }
                     }
-                    Col::Var(v) => {
+                    FactorColumn::Var(v) => {
                         if let Some(existing) = &binding[*v] {
                             if existing != &row[ci] {
                                 ok = false;
@@ -2005,7 +2036,7 @@ mod tests {
                             undo.push(*v);
                         }
                     }
-                    Col::Compound(_) => {
+                    FactorColumn::Term(_) => {
                         ok = false;
                         break;
                     }
@@ -2170,230 +2201,6 @@ mod tests {
         }
     }
 
-    /// A structured fact column for the schematic differential: a ground value, or a stored variable
-    /// identified by a fact-local slot (so the same slot twice in one fact is coreferent).
-    #[derive(Clone)]
-    enum FCol {
-        G(Vec<u8>),
-        V(usize),
-    }
-
-    /// Encode a fact, assigning MORK's NewVar to a slot's first occurrence and VarRef to repeats,
-    /// exactly as the stored encoding represents schematic facts and their coreference.
-    fn encode_fact(rel: &str, cols: &[FCol]) -> Vec<u8> {
-        let mut v = vec![TAG_ARITY | (1 + cols.len()) as u8];
-        v.extend(sym(rel));
-        let mut introduced: Vec<usize> = Vec::new();
-        for col in cols {
-            match col {
-                FCol::G(g) => v.extend_from_slice(g),
-                FCol::V(slot) => {
-                    if let Some(idx) = introduced.iter().position(|s| s == slot) {
-                        v.push(TAG_VARREF | idx as u8);
-                    } else {
-                        introduced.push(*slot);
-                        v.push(NEWVAR_BYTE);
-                    }
-                }
-            }
-        }
-        v
-    }
-
-    /// A random binary fact: each column ground (small symbol set) or a stored variable (slot 0/1),
-    /// so the corpus mixes ground, single-variable, coreferent, and two-variable schematic facts.
-    fn gen_fact(rng: &mut Lcg, syms: &[Vec<u8>]) -> Vec<FCol> {
-        (0..2)
-            .map(|_| {
-                if rng.below(3) == 0 {
-                    FCol::V(rng.below(2))
-                } else {
-                    FCol::G(syms[rng.below(syms.len())].clone())
-                }
-            })
-            .collect()
-    }
-
-    /// Reference unification join: nested loop over one fact per factor, each fact renamed apart,
-    /// unifying its columns with the query variables through the same trail. Collects fully-ground
-    /// answer rows, the same projection the zipper join emits.
-    fn naive_rec(
-        fi: usize,
-        factors: &[Factor],
-        factor_facts: &[Vec<Vec<FCol>>],
-        env: &mut Env,
-        nvars: usize,
-        out: &mut BTreeSet<Vec<Vec<u8>>>,
-    ) {
-        if fi == factors.len() {
-            let mut row = Vec::with_capacity(nvars);
-            for v in 0..nvars {
-                match env.ground_of(v) {
-                    Some(g) => row.push(g),
-                    None => return,
-                }
-            }
-            out.insert(row);
-            return;
-        }
-        for fact in &factor_facts[fi] {
-            let mark = env.mark();
-            let mut slot_ids: std::collections::HashMap<usize, usize> =
-                std::collections::HashMap::new();
-            let mut ok = true;
-            for (ci, fact_col) in fact.iter().enumerate() {
-                let mut slot_id = |slot: usize, env: &mut Env| match slot_ids.get(&slot) {
-                    Some(&id) => id,
-                    None => {
-                        let id = env.fresh();
-                        slot_ids.insert(slot, id);
-                        id
-                    }
-                };
-                let cok = match (&factors[fi].cols[ci], fact_col) {
-                    (Col::Ground(q), FCol::G(g)) => q == g,
-                    (Col::Ground(q), FCol::V(slot)) => {
-                        let id = slot_id(*slot, env);
-                        env.unify_var_ground(id, q)
-                    }
-                    (Col::Var(v), FCol::G(g)) => env.unify_var_ground(*v, g),
-                    (Col::Var(v), FCol::V(slot)) => {
-                        let id = slot_id(*slot, env);
-                        env.unify_var_var(*v, id)
-                    }
-                    (Col::Compound(q), FCol::G(g)) => {
-                        env.unify_terms(&Col::Compound(q.clone()), &Col::Ground(g.clone()))
-                    }
-                    (Col::Compound(q), FCol::V(slot)) => {
-                        let id = slot_id(*slot, env);
-                        env.unify_var_term(id, &Col::Compound(q.clone()))
-                    }
-                };
-                if !cok {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                naive_rec(fi + 1, factors, factor_facts, env, nvars, out);
-            }
-            env.rollback(mark);
-        }
-    }
-
-    #[test]
-    fn unify_join_matches_naive() {
-        for seed in 0..400u64 {
-            let mut rng = Lcg::new(seed.wrapping_add(11));
-            let nsyms = 2 + rng.below(2);
-            let syms: Vec<Vec<u8>> = (0..nsyms)
-                .map(|i| sym(&((b'a' + i as u8) as char).to_string()))
-                .collect();
-
-            let mut map = PathMap::<()>::new();
-            let mut e_facts: Vec<Vec<FCol>> = Vec::new();
-            let mut f_facts: Vec<Vec<FCol>> = Vec::new();
-            let nfacts = 3 + rng.below(6);
-            for _ in 0..nfacts {
-                let fe = gen_fact(&mut rng, &syms);
-                if map.insert(&encode_fact("e", &fe), ()).is_none() {
-                    e_facts.push(fe);
-                }
-                let ff = gen_fact(&mut rng, &syms);
-                if map.insert(&encode_fact("f", &ff), ()).is_none() {
-                    f_facts.push(ff);
-                }
-            }
-            let pe = relation_prefix("e", 3);
-            let pf = relation_prefix("f", 3);
-
-            let queries: Vec<(Vec<Factor>, Vec<usize>, usize)> = vec![
-                (
-                    vec![Factor::var_cols(pe.clone(), vec![0, 1])],
-                    vec![0, 1],
-                    2,
-                ),
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                    ],
-                    vec![0, 1, 2],
-                    3,
-                ),
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![0, 2]),
-                    ],
-                    vec![0, 1, 2],
-                    3,
-                ),
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pf.clone(), vec![1, 2]),
-                    ],
-                    vec![0, 1, 2],
-                    3,
-                ),
-                // cyclic: triangle over schematic edges (the catch-up-with-unification path).
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 0]),
-                    ],
-                    vec![0, 1, 2],
-                    3,
-                ),
-                // cyclic four-cycle over schematic edges.
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 3]),
-                        Factor::var_cols(pe.clone(), vec![3, 0]),
-                    ],
-                    vec![0, 1, 2, 3],
-                    4,
-                ),
-                // intra-query coreference exercised against schematic data: (e $0 $1)(e $1 $0).
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 0]),
-                    ],
-                    vec![0, 1],
-                    2,
-                ),
-            ];
-
-            for (factors, order, nvars) in &queries {
-                let factor_facts: Vec<Vec<Vec<FCol>>> = factors
-                    .iter()
-                    .map(|fac| {
-                        if fac.prefix == pe {
-                            e_facts.clone()
-                        } else {
-                            f_facts.clone()
-                        }
-                    })
-                    .collect();
-
-                let got = unify_join_zipper(&map, factors, order, *nvars);
-                let mut env = Env::new(*nvars);
-                let mut want = BTreeSet::new();
-                naive_rec(0, factors, &factor_facts, &mut env, *nvars, &mut want);
-
-                assert_eq!(
-                    got, want,
-                    "seed {seed}: unify join must match the naive unifier"
-                );
-            }
-        }
-    }
-
     #[test]
     fn least_ge_matches_brute_force() {
         let sets: &[&[u8]] = &[
@@ -2416,29 +2223,29 @@ mod tests {
     #[test]
     fn first_subterm_len_parses_each_shape() {
         // symbol "ab": SymbolSize(2), 'a', 'b'  -> 3 bytes
-        let sym = [TAG_SYMSIZE | 2, b'a', b'b'];
+        let sym = [item_byte(Tag::SymbolSize(2)), b'a', b'b'];
         assert_eq!(first_subterm_len(&sym), 3);
         assert!(first_subterm_is_ground(&sym));
 
         // NewVar -> 1 byte, non-ground
-        let nv = [NEWVAR_BYTE];
+        let nv = [item_byte(Tag::NewVar)];
         assert_eq!(first_subterm_len(&nv), 1);
         assert!(!first_subterm_is_ground(&nv));
 
         // VarRef(0) -> 1 byte, non-ground
-        let vr = [TAG_VARREF | 0];
+        let vr = [item_byte(Tag::VarRef(0))];
         assert_eq!(first_subterm_len(&vr), 1);
         assert!(!first_subterm_is_ground(&vr));
 
         // (k v0):  Arity(2), Sym("k"), Sym("v0")
-        let k = TAG_SYMSIZE | 1;
-        let v0 = TAG_SYMSIZE | 2;
-        let compound = [TAG_ARITY | 2, k, b'k', v0, b'v', b'0'];
+        let k = item_byte(Tag::SymbolSize(1));
+        let v0 = item_byte(Tag::SymbolSize(2));
+        let compound = [item_byte(Tag::Arity(2)), k, b'k', v0, b'v', b'0'];
         assert_eq!(first_subterm_len(&compound), 6);
         assert!(first_subterm_is_ground(&compound));
 
         // (k $x): Arity(2), Sym("k"), NewVar  -> 4 bytes, non-ground
-        let compound_var = [TAG_ARITY | 2, k, b'k', NEWVAR_BYTE];
+        let compound_var = [item_byte(Tag::Arity(2)), k, b'k', item_byte(Tag::NewVar)];
         assert_eq!(first_subterm_len(&compound_var), 4);
         assert!(!first_subterm_is_ground(&compound_var));
 
@@ -2446,5 +2253,243 @@ mod tests {
         let mut buf = compound.to_vec();
         buf.extend_from_slice(&[0xFF, 0xFF]);
         assert_eq!(first_subterm_len(&buf), 6);
+    }
+
+    /// A generated fact column: a ground symbol, or a fact variable slot (a slot shared within the
+    /// fact encodes as NewVar on first use and VarRef after, so facts can be coreferent).
+    enum FCol {
+        G(Vec<u8>),
+        V(usize),
+    }
+
+    fn encode_fact(rel: &str, cols: &[FCol]) -> Vec<u8> {
+        let mut v = vec![item_byte(Tag::Arity((1 + cols.len()) as u8))];
+        v.extend(sym(rel));
+        let mut introduced: Vec<usize> = Vec::new();
+        for col in cols {
+            match col {
+                FCol::G(g) => v.extend_from_slice(g),
+                FCol::V(slot) => match introduced.iter().position(|s| s == slot) {
+                    Some(idx) => v.push(item_byte(Tag::VarRef(idx as u8))),
+                    None => {
+                        introduced.push(*slot);
+                        v.push(item_byte(Tag::NewVar));
+                    }
+                },
+            }
+        }
+        v
+    }
+
+    fn gen_fact(rng: &mut Lcg, syms: &[Vec<u8>]) -> Vec<FCol> {
+        (0..2)
+            .map(|_| {
+                if rng.below(3) == 0 {
+                    FCol::V(rng.below(2))
+                } else {
+                    FCol::G(syms[rng.below(syms.len())].clone())
+                }
+            })
+            .collect()
+    }
+
+    /// A query factor as one expression for the naive reference: the relation prefix followed by
+    /// every column, with each query variable encoded as a VarRef of its GLOBAL id. `var_opt`
+    /// reads a VarRef id as absolute within its namespace, so all factors share their variables
+    /// through namespace `QUERY_NS` with no per-factor renumbering.
+    fn naive_query_expr(factor: &Factor) -> Vec<u8> {
+        let mut v = factor.prefix.clone();
+        for col in &factor.cols {
+            match col {
+                FactorColumn::Var(id) => v.push(item_byte(Tag::VarRef(*id as u8))),
+                FactorColumn::Term(term) => v.extend_from_slice(&term.bytes),
+            }
+        }
+        v
+    }
+
+    /// Nested-loop reference join over the SAME stock unifier: pick one fact per factor, unify the
+    /// accumulated factor/fact equations with `mork_expr::unify` (pruning at the first failing
+    /// level), and at the leaf keep the row when every query variable dereferences to ground. The
+    /// leapfrog and this reference share `unify`, so a divergence is in the join order, not the
+    /// unification.
+    fn naive_rec(
+        fi: usize,
+        query_exprs: &[Vec<u8>],
+        factor_facts: &[Vec<Vec<u8>>],
+        chosen: &mut Vec<Vec<u8>>,
+        nvars: usize,
+        out: &mut BTreeSet<Vec<Vec<u8>>>,
+    ) {
+        let mut pairs: Vec<(ExprEnv, ExprEnv)> = query_exprs[..fi]
+            .iter()
+            .zip(chosen.iter())
+            .enumerate()
+            .map(|(i, (q, f))| {
+                (
+                    ExprEnv::new(QUERY_NS, expr_from_bytes(q)),
+                    ExprEnv::new(1 + i as u8, expr_from_bytes(f)),
+                )
+            })
+            .collect();
+        let Ok(bindings) = unify(&mut pairs) else {
+            return;
+        };
+        if fi == query_exprs.len() {
+            let mut row = Vec::with_capacity(nvars);
+            for v in 0..nvars {
+                let mut env = ExprEnv {
+                    n: QUERY_NS,
+                    v: v as u8,
+                    offset: 0,
+                    base: expr_from_bytes(&NEW_VAR_EXPR_BYTES),
+                };
+                loop {
+                    let Some(var) = env.var_opt() else { break };
+                    match bindings.get(&var) {
+                        Some(next) => env = *next,
+                        None => return, // still free: the all-ground join drops this row
+                    }
+                }
+                let bytes = unsafe { env.subsexpr().span().as_ref().unwrap() }.to_vec();
+                if !first_subterm_is_ground(&bytes) {
+                    return;
+                }
+                row.push(bytes);
+            }
+            out.insert(row);
+            return;
+        }
+        for fact in &factor_facts[fi] {
+            chosen.push(fact.clone());
+            naive_rec(fi + 1, query_exprs, factor_facts, chosen, nvars, out);
+            chosen.pop();
+        }
+    }
+
+    #[test]
+    fn unify_join_matches_naive_on_schematic_facts() {
+        for seed in 0..400u64 {
+            let mut rng = Lcg::new(seed.wrapping_add(11));
+            let nsyms = 2 + rng.below(2);
+            let syms: Vec<Vec<u8>> = (0..nsyms)
+                .map(|i| sym(&((b'a' + i as u8) as char).to_string()))
+                .collect();
+
+            let mut map = PathMap::<()>::new();
+            let mut e_facts: Vec<Vec<u8>> = Vec::new();
+            let mut f_facts: Vec<Vec<u8>> = Vec::new();
+            let nfacts = 3 + rng.below(6);
+            for _ in 0..nfacts {
+                let fe = encode_fact("e", &gen_fact(&mut rng, &syms));
+                if map.insert(&fe, ()).is_none() {
+                    e_facts.push(fe);
+                }
+                let ff = encode_fact("f", &gen_fact(&mut rng, &syms));
+                if map.insert(&ff, ()).is_none() {
+                    f_facts.push(ff);
+                }
+            }
+            let pe = relation_prefix("e", 3);
+            let pf = relation_prefix("f", 3);
+
+            let queries: Vec<(Vec<Factor>, Vec<usize>, usize)> = vec![
+                // single factor  (e $0 $1)
+                (
+                    vec![Factor::var_cols(pe.clone(), vec![0, 1])],
+                    vec![0, 1],
+                    2,
+                ),
+                // path  (e $0 $1)(e $1 $2)
+                (
+                    vec![
+                        Factor::var_cols(pe.clone(), vec![0, 1]),
+                        Factor::var_cols(pe.clone(), vec![1, 2]),
+                    ],
+                    vec![0, 1, 2],
+                    3,
+                ),
+                // star  (e $0 $1)(e $0 $2)
+                (
+                    vec![
+                        Factor::var_cols(pe.clone(), vec![0, 1]),
+                        Factor::var_cols(pe.clone(), vec![0, 2]),
+                    ],
+                    vec![0, 1, 2],
+                    3,
+                ),
+                // two-relation path  (e $0 $1)(f $1 $2)
+                (
+                    vec![
+                        Factor::var_cols(pe.clone(), vec![0, 1]),
+                        Factor::var_cols(pf.clone(), vec![1, 2]),
+                    ],
+                    vec![0, 1, 2],
+                    3,
+                ),
+                // cyclic triangle over schematic edges (the re-index + catch-up path).
+                (
+                    vec![
+                        Factor::var_cols(pe.clone(), vec![0, 1]),
+                        Factor::var_cols(pe.clone(), vec![1, 2]),
+                        Factor::var_cols(pe.clone(), vec![2, 0]),
+                    ],
+                    vec![0, 1, 2],
+                    3,
+                ),
+                // cyclic four-cycle over schematic edges.
+                (
+                    vec![
+                        Factor::var_cols(pe.clone(), vec![0, 1]),
+                        Factor::var_cols(pe.clone(), vec![1, 2]),
+                        Factor::var_cols(pe.clone(), vec![2, 3]),
+                        Factor::var_cols(pe.clone(), vec![3, 0]),
+                    ],
+                    vec![0, 1, 2, 3],
+                    4,
+                ),
+                // swap pair  (e $0 $1)(e $1 $0)
+                (
+                    vec![
+                        Factor::var_cols(pe.clone(), vec![0, 1]),
+                        Factor::var_cols(pe.clone(), vec![1, 0]),
+                    ],
+                    vec![0, 1],
+                    2,
+                ),
+                // intra-factor coreference  (e $0 $0) against schematic facts.
+                (vec![Factor::var_cols(pe.clone(), vec![0, 0])], vec![0], 1),
+            ];
+
+            for (qi, (factors, order, nvars)) in queries.iter().enumerate() {
+                let query_exprs: Vec<Vec<u8>> = factors.iter().map(naive_query_expr).collect();
+                let factor_facts: Vec<Vec<Vec<u8>>> = factors
+                    .iter()
+                    .map(|fac| {
+                        if fac.prefix == pe {
+                            e_facts.clone()
+                        } else {
+                            f_facts.clone()
+                        }
+                    })
+                    .collect();
+
+                let got = unify_join_zipper(&map, factors, order, *nvars);
+                let mut want = BTreeSet::new();
+                let mut chosen = Vec::new();
+                naive_rec(
+                    0,
+                    &query_exprs,
+                    &factor_facts,
+                    &mut chosen,
+                    *nvars,
+                    &mut want,
+                );
+                assert_eq!(
+                    got, want,
+                    "seed {seed} query {qi}: leapfrog and the stock-unify nested loop must agree"
+                );
+            }
+        }
     }
 }
