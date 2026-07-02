@@ -10,8 +10,8 @@
 #                                       run it on both engines, diff the result spaces, print times
 #
 # MORK_LEAPFROG=0 pins the stock ProductZipper path, MORK_LEAPFROG=all dispatches every routable
-# body; the default dispatches cyclic conjunctive bodies, cyclicity checked over the seekable
-# columns and modulo functional dependencies probed from the data.
+# body; the default dispatches cyclic conjunctive bodies whose instance can pay: cyclicity over
+# the seekable columns, modulo functional dependencies, sized and skew-sampled by bounded walks.
 #
 # This clones upstream MORK and PathMap at pinned commits and overlays one module
 # (kernel/src/zipper_join.rs), one example, a single `pub mod` line, and one reviewable engine

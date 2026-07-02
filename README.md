@@ -136,24 +136,29 @@ inputs, and match multiplicity is preserved. Interpreted sources and sinks (`I`/
 the pattern-directed dumps keep the stock path and its enumeration order.
 
 Dispatch follows a measured policy, not a reflex: a body routes to the join only when it has a
-cycle the leapfrog can seek and win on. Three conjuncts, cheapest first: cyclic over the
-whole-column variables (a cycle carried only inside compound arguments gives the seek nothing, and
-the counter machine measured 1.6× slower without this conjunct), cyclic over the full variable
-sets (alpha-acyclic queries are where a relation-at-a-time plan already meets the optimal bound,
-which declines paths, semijoins, and pure products without reading data), and not functionally
-degenerate (a diamond of function tables is a real hyperedge cycle whose AGM bound still collapses
-to O(N), so a bounded data probe detects each simple factor's trailing functional dependency and
-re-runs the reduction; `finite_domain`, exactly that shape, measured 3.7× slower dispatched and
-now declines at 79 ms against 70 stock, the residual being the one-time confirm scan of the
-genuinely functional tables). A graph's `edge` disproves its dependency at the first repeated
-source, so a genuine cyclic pattern stops paying for the probe within a few facts and dispatches.
-Dispatched everywhere instead (`MORK_LEAPFROG=all`), the counter machine runs 3.4× slower and a
-10⁶-tuple pure product 1.8× slower, while one body, a gini step whose factors share variables
-inside compounds over a large relation, wins 1.8×; taking that winner too is a cardinality
-question, the per-eval cost-based dispatch that is the next step.
+cycle the leapfrog can seek and win on, over an instance where winning is possible. The shape
+conjuncts come first and read no data: cyclic over the whole-column variables (a cycle carried
+only inside compound arguments gives the seek nothing; the counter machine measured 1.6× slower
+without this conjunct), and cyclic over the full variable sets (alpha-acyclic queries are where a
+relation-at-a-time plan already meets the optimal bound, which declines paths, semijoins,
+enumerations, and pure products outright). Then the instance decides, through bounded cursor
+walks. Every relation tiny: decline, the ProductZipper's constants win either way (the tile
+puzzle's 56-fact inequality tables). Four or more join factors: dispatch, the product deepens
+multiplicatively while the join stays output-bounded (`bench clique`'s 6- and 10-factor queries
+run 50× faster dispatched, 15.6 s to 0.3 s). Exactly three factors: dispatch only when a bounded
+sample of first-argument values finds a heavy hitter, the hub a product blows up through (the
+240× triangle); `bench transitive`'s triangle detect over a million uniform random edges has
+none, measured 15% slower dispatched, and declines to exact parity. Last, the functional
+dependency probe: a diamond of function tables is a real hyperedge cycle whose AGM bound still
+collapses to O(N), so a bounded scan detects each simple factor's trailing dependency and re-runs
+the reduction (`finite_domain`, exactly that shape, measured 3.7× slower under the earliest
+shared-column rule and declines at parity now). A hub outside the sample window or a mislabeled
+instance only ever falls back to stock performance; the exact version of these decisions is a
+cost-based dispatch, which the capped walks approximate.
 
-On the stock resource suite the default policy
-is at parity everywhere, and the triangle above is 232×. The boundary in one contrast: the s=4096
+On the full stock benchmark suite (`mork bench`, all twelve) the default policy
+is at parity or faster everywhere, with `clique` 50× faster end to end, and the triangle above is
+232×. The boundary in one contrast: the s=4096
 triangle as a plain MM2 file runs `./run.sh compare` at 2497 ms stock against 10 ms wired,
 byte-identical; `bench bfc` at size 19 (a 14.5 s proof search emitting 2.9M atoms) runs at parity,
 because its hot bodies are single-factor `sol` lookups with no product to prune, where callgrind
