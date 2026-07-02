@@ -135,15 +135,24 @@ with the pattern factors exactly as `query_multi_raw` does, and re-derives the b
 inputs, and match multiplicity is preserved. Interpreted sources and sinks (`I`/`O` bodies) and
 the pattern-directed dumps keep the stock path and its enumeration order.
 
-Dispatch follows a measured policy, not a reflex: only bodies with a variable occurring as a whole
-column in two or more factors route to the join, the class where an intersection exists for the
-seek to exploit. Every other body returns the same matches from either engine, and there the
-join's per-candidate machinery loses or ties against the ProductZipper's straight-line byte walk:
-dispatched everywhere (`MORK_LEAPFROG=all`), the counter-machine resource runs 3.4× slower and a
+Dispatch follows a measured policy, not a reflex: a body routes to the join only when it has a
+cycle the leapfrog can seek and win on. Three conjuncts, cheapest first: cyclic over the
+whole-column variables (a cycle carried only inside compound arguments gives the seek nothing, and
+the counter machine measured 1.6× slower without this conjunct), cyclic over the full variable
+sets (alpha-acyclic queries are where a relation-at-a-time plan already meets the optimal bound,
+which declines paths, semijoins, and pure products without reading data), and not functionally
+degenerate (a diamond of function tables is a real hyperedge cycle whose AGM bound still collapses
+to O(N), so a bounded data probe detects each simple factor's trailing functional dependency and
+re-runs the reduction; `finite_domain`, exactly that shape, measured 3.7× slower dispatched and
+now declines at 79 ms against 70 stock, the residual being the one-time confirm scan of the
+genuinely functional tables). A graph's `edge` disproves its dependency at the first repeated
+source, so a genuine cyclic pattern stops paying for the probe within a few facts and dispatches.
+Dispatched everywhere instead (`MORK_LEAPFROG=all`), the counter machine runs 3.4× slower and a
 10⁶-tuple pure product 1.8× slower, while one body, a gini step whose factors share variables
-inside compounds over a large relation, wins 1.8×. Telling that winner apart from the counter
-statically is a cardinality question, not a shape question, so the default stays conservative and
-the per-eval cost-based dispatch is the next step. On the stock resource suite the default policy
+inside compounds over a large relation, wins 1.8×; taking that winner too is a cardinality
+question, the per-eval cost-based dispatch that is the next step.
+
+On the stock resource suite the default policy
 is at parity everywhere, and the triangle above is 232×. The boundary in one contrast: the s=4096
 triangle as a plain MM2 file runs `./run.sh compare` at 2497 ms stock against 10 ms wired,
 byte-identical; `bench bfc` at size 19 (a 14.5 s proof search emitting 2.9M atoms) runs at parity,
