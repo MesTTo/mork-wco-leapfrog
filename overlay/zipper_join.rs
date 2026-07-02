@@ -1131,7 +1131,7 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
             return None;
         }
         if LEAPFROG_DISPATCH.with(|c| c.get()) != DispatchMode::All
-            && !body_factors_profit_from_leapfrog(&factors, nvars)
+            && !body_factors_profit_from_leapfrog(map, &factors, nvars)
         {
             return None;
         }
@@ -1182,32 +1182,474 @@ fn body_factors_routable_to_zipper_join(factors: &[Factor]) -> bool {
     !factors.is_empty()
 }
 
-/// The engine dispatch's performance policy, distinct from routability: dispatch only a body with
-/// a variable the leapfrog can seek on, one occurring as a whole column in two or more factors.
-/// In that class the seek prunes a product the ProductZipper walks (the triangle's 231x), and no
-/// stock workload loses. Elsewhere the join returns the same matches through its per-candidate
-/// machinery (fresh zipper descents, a bindings store), and `MORK_LEAPFROG=all`, which dispatches
-/// every routable body, measures how that goes: the counter machine's small hot
-/// enumeration-and-filter bodies run 3.4x slower (callgrind: 3.3x the instructions), a 10^6-tuple
-/// pure product runs 1.8x slower, and one body profits, the decision-tree gini step whose
-/// factors share variables inside compounds over a large `population` relation, 1.8x
-/// whole-program. Telling that body apart from the counter's statically is a cardinality
-/// question, not a shape question, so it is left to a cost-based dispatch rather than a broader
-/// static rule. The check is parse-level, and correctness never depends on it, since both paths
-/// return the same matches.
-fn body_factors_profit_from_leapfrog(factors: &[Factor], nvars: usize) -> bool {
-    let mut col_occurrences = vec![0usize; nvars];
-    for factor in factors {
-        for col in &factor.cols {
-            if let FactorColumn::Var(v) = col {
-                col_occurrences[*v] += 1;
-                if col_occurrences[*v] >= 2 {
-                    return true;
+/// Collect the query variables of one factor into `out`: the top-level `Var` columns and every
+/// variable nested in a `Term` column. A NewVar takes the next id after the ones introduced before
+/// this term (`term.intro`), a VarRef names its id, matching the body's global numbering.
+fn collect_factor_vars(factor: &Factor, out: &mut std::collections::BTreeSet<usize>) {
+    for col in &factor.cols {
+        match col {
+            FactorColumn::Var(v) => {
+                out.insert(*v);
+            }
+            FactorColumn::Term(term) => {
+                let mut ez = ExprZipper::new(term.expr());
+                let mut intro = term.intro as usize;
+                loop {
+                    match ez.tag() {
+                        Tag::NewVar => {
+                            out.insert(intro);
+                            intro += 1;
+                        }
+                        Tag::VarRef(i) => {
+                            out.insert(i as usize);
+                        }
+                        Tag::SymbolSize(_) | Tag::Arity(_) => {}
+                    }
+                    if !ez.next() {
+                        break;
+                    }
                 }
             }
         }
     }
+}
+
+/// Row cap for the functional-dependency probe. Below it a relation is walked in full and its
+/// trailing FD decided exactly; a body whose relations all fit is cheap to probe. Above it the
+/// probe is skipped and the structurally cyclic body dispatches, which is correct: at that scale a
+/// genuine cyclic graph pattern is the worst-case-optimal join's win, and reading the whole
+/// relation to decide would cost more than it saves (following the fork's 200k threshold).
+const FD_PROBE_ROW_CAP: usize = 200_000;
+
+/// The engine dispatch's performance policy, distinct from routability: dispatch a body only when
+/// it has a cycle the leapfrog can seek and win on. Three conjuncts, each with a measured
+/// counterexample behind it, cheapest first.
+///
+/// The cycle must be seekable: cyclic over the variables that occur as whole columns, because a
+/// whole column is what the leapfrog intersects on the trie. A body whose cycle is carried only
+/// inside compound arguments (the counter machine's `(IC $i)`, `(JZ $r $j)`) gives the seek
+/// nothing, and its small hot queries pay only the join's per-candidate machinery (measured 1.6x
+/// slower dispatched).
+///
+/// The cycle must be genuine: cyclic over the full variable sets, nested occurrences included,
+/// because alpha-acyclic queries are where a relation-at-a-time plan already meets the optimal
+/// bound, O(input + output), and the seek beats the product asymptotically only where every such
+/// plan builds a super-linear intermediate the AGM bound forbids the answer from having (Ngo et
+/// al. 2012). This declines paths, semijoins, enumeration-and-filter, and pure products without
+/// reading data (a 10^6-tuple product measured 1.8x slower dispatched).
+///
+/// And the cycle must not be functionally degenerate: `(a /\ b = c)(a \/ b = d)(c - d = e)` is a
+/// real hyperedge diamond, but each relation is a function, so its AGM bound collapses to O(N)
+/// (Gottlob-Lee-Valiant-Valiant; Abo Khamis-Ngo-Suciu) and the leapfrog wins nothing
+/// (finite_domain measured 3.8x slower dispatched). Only for bodies the first two conjuncts pass
+/// does the probe read bounded data: it detects each relation's trailing functional dependency
+/// (the `(lhs.. = result)` convention) by comparing the distinct determinant projection against
+/// the full rows, folds every dependent into the atoms holding its determinant, and re-runs GYO.
+/// A graph's `edge` disproves its FD at the first repeated source, so a genuine cyclic pattern
+/// stops paying for the scan within a few facts and dispatches.
+///
+/// Correctness never depends on any of this, since both paths return the same matches.
+///
+/// Within the cyclic non-functional class, the instance still decides who wins, and the full
+/// bench suite measured the boundary. Every relation tiny: the whole query is fast either way
+/// and the ProductZipper's constants win (the tile puzzle's inequality tables), so it declines.
+/// Four or more join factors: a relation-at-a-time product deepens multiplicatively while the
+/// join stays output-bounded (the clique bench's 6- and 10-factor queries ran 50x faster
+/// dispatched), so it dispatches. Three factors: only skew pays, so a bounded probe samples
+/// first-argument values for a heavy hitter, the hub through which a product blows up
+/// quadratically (the 240x triangle); a uniform instance has none and declines (the transitive
+/// bench's triangle detect over a million random edges measured 15% slower dispatched, and
+/// declines). A hub outside the sample window is missed, and the body then merely stays on the
+/// stock path; telling those apart exactly is the cost-based dispatch this policy approximates
+/// with bounded reads.
+fn body_factors_profit_from_leapfrog(map: &PathMap<()>, factors: &[Factor], nvars: usize) -> bool {
+    if !(hypergraph_is_cyclic(column_var_edges(factors), nvars) && body_is_cyclic(factors, nvars)) {
+        return false;
+    }
+    let counts: Vec<usize> = factors
+        .iter()
+        .map(|f| bounded_fact_count(map, f, DISPATCH_MIN_FACTS))
+        .collect();
+    if counts.iter().all(|c| *c < DISPATCH_MIN_FACTS) {
+        return false;
+    }
+    if factors.len() < DISPATCH_MANY_FACTORS {
+        let heavy = factors
+            .iter()
+            .zip(&counts)
+            .any(|(f, c)| *c >= DISPATCH_MIN_FACTS && factor_has_sampled_heavy_hitter(map, f));
+        if !heavy {
+            return false;
+        }
+    }
+    !body_is_acyclic_modulo_fds(map, factors, nvars)
+}
+
+/// Below this many facts in every factor's relation the query is small either way and the
+/// ProductZipper's straight-line constants win; the tile puzzle's 56-fact inequality tables
+/// measured a mild loss dispatched, while the demonstration's smallest hub instance (265 facts)
+/// must still dispatch.
+const DISPATCH_MIN_FACTS: usize = 128;
+
+/// From this many join factors on, the relation-at-a-time product deepens multiplicatively while
+/// the join stays output-bounded, skewed instance or not: the clique bench's 6- and 10-factor
+/// queries measured 50x faster dispatched on a graph whose 3-factor triangle declines.
+const DISPATCH_MANY_FACTORS: usize = 4;
+
+/// A first-argument value with this many continuations is a heavy hitter: the product through it
+/// blows up quadratically. Uniform random graphs (the transitive bench's degrees average ~20)
+/// stay below it and decline.
+const DISPATCH_HEAVY_DEGREE: usize = 64;
+
+/// How many first-argument values the heavy-hitter probe samples, in trie order.
+const DISPATCH_HEAVY_SAMPLES: usize = 64;
+
+/// The factor's relation region: its prefix, extended by the head column when the head is a
+/// ground symbol, so the counts and samples read this relation rather than every same-arity fact.
+fn factor_scan_path(factor: &Factor) -> Vec<u8> {
+    let mut p = factor.prefix.clone();
+    if let Some(FactorColumn::Term(head)) = factor.cols.first() {
+        if head.is_ground() {
+            p.extend_from_slice(&head.bytes);
+        }
+    }
+    p
+}
+
+/// Count the facts under the factor's relation region, stopping at `cap`: a bounded walk, so the
+/// gate's cost stays independent of the space size.
+fn bounded_fact_count(map: &PathMap<()>, factor: &Factor, cap: usize) -> usize {
+    let mut rz = map.read_zipper_at_path(&factor_scan_path(factor));
+    let mut n = 0;
+    while n < cap && rz.to_next_val() {
+        n += 1;
+    }
+    n
+}
+
+/// Sample up to [`DISPATCH_HEAVY_SAMPLES`] first-argument values of the factor's relation, in
+/// trie order, and report whether any has [`DISPATCH_HEAVY_DEGREE`] or more continuations. Both
+/// walks are capped, so the probe reads a bounded region regardless of the space size.
+fn factor_has_sampled_heavy_hitter(map: &PathMap<()>, factor: &Factor) -> bool {
+    let base = factor_scan_path(factor);
+    let mut cur = SubtermCursor::new(map.read_zipper_at_path(&base));
+    cur.first();
+    let mut sampled = 0;
+    while sampled < DISPATCH_HEAVY_SAMPLES && !cur.at_end() {
+        let Some(key) = cur.key() else { break };
+        let mut path = base.clone();
+        path.extend_from_slice(key);
+        let mut inner = SubtermCursor::new(map.read_zipper_at_path(&path));
+        inner.first();
+        let mut deg = 0;
+        while !inner.at_end() && deg < DISPATCH_HEAVY_DEGREE {
+            deg += 1;
+            inner.next();
+        }
+        if deg >= DISPATCH_HEAVY_DEGREE {
+            return true;
+        }
+        sampled += 1;
+        cur.next();
+    }
     false
+}
+
+/// The hyperedges of the variables the leapfrog can seek: per factor, its whole-column variables
+/// only, compound-nested occurrences excluded.
+fn column_var_edges(factors: &[Factor]) -> Vec<std::collections::BTreeSet<usize>> {
+    factors
+        .iter()
+        .map(|f| {
+            f.cols
+                .iter()
+                .filter_map(|col| match col {
+                    FactorColumn::Var(v) => Some(*v),
+                    FactorColumn::Term(_) => None,
+                })
+                .collect::<std::collections::BTreeSet<usize>>()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The ordered distinct query variables of a factor when every column is simple (a top-level
+/// variable or a ground symbol), else `None`. Only these factors carry a decidable trailing FD in
+/// the `(lhs.. = result)` sense; a compound column has no such reading, so its factor contributes
+/// no FD and stays a plain hyperedge.
+fn factor_simple_var_schema(factor: &Factor) -> Option<Vec<usize>> {
+    let mut schema = Vec::new();
+    for col in &factor.cols {
+        match col {
+            FactorColumn::Var(v) => {
+                if !schema.contains(v) {
+                    schema.push(*v);
+                }
+            }
+            FactorColumn::Term(term)
+                if term.is_ground() && matches!(term.tag(), Tag::SymbolSize(_)) => {}
+            _ => return None,
+        }
+    }
+    Some(schema)
+}
+
+/// Per-factor accumulator for the trailing-FD probe, driven by one shared walk of the facts under
+/// the factor's prefix. The column plan is precomputed so folding a fact needs no allocation until
+/// it passes the factor's ground columns: `ground_cols` are the (index, bytes) a fact must match,
+/// `var_cols` the (index, variable) bindings, and `schema` the variable order (determinant is all
+/// but the last, dependent is the last). `over_cap` trips when the relation exceeds the probe cap.
+struct FactorFd {
+    schema: Vec<usize>,
+    ground_cols: Vec<(usize, Vec<u8>)>,
+    var_cols: Vec<(usize, usize)>,
+    det_rows: std::collections::BTreeSet<Vec<u8>>,
+    full_rows: std::collections::BTreeSet<Vec<u8>>,
+    seen: usize,
+    /// Set when the factor can no longer yield an FD: the relation exceeded the probe cap, or a
+    /// determinant collision already disproved functionality. A genuinely relational factor (a
+    /// graph's `edge`) collides within its first few facts, so it stops paying for the scan
+    /// almost immediately; only a genuinely functional table is read in full, where the read buys
+    /// the decline.
+    dead: bool,
+}
+
+impl FactorFd {
+    fn new(factor: &Factor, schema: Vec<usize>) -> Self {
+        let mut ground_cols = Vec::new();
+        let mut var_cols = Vec::new();
+        for (ci, col) in factor.cols.iter().enumerate() {
+            match col {
+                FactorColumn::Var(v) => var_cols.push((ci, *v)),
+                FactorColumn::Term(term) => ground_cols.push((ci, term.bytes.clone())),
+            }
+        }
+        FactorFd {
+            schema,
+            ground_cols,
+            var_cols,
+            det_rows: std::collections::BTreeSet::new(),
+            full_rows: std::collections::BTreeSet::new(),
+            seen: 0,
+            dead: false,
+        }
+    }
+
+    /// Fold one fact's column spans into the accumulator, if the fact matches the factor's ground
+    /// columns and its repeated variables agree. Rejects on the ground columns before allocating.
+    fn observe(&mut self, cols: &[&[u8]]) {
+        if self.dead {
+            return;
+        }
+        for (ci, bytes) in &self.ground_cols {
+            if cols[*ci] != &bytes[..] {
+                return;
+            }
+        }
+        // Bind each variable to its first column's value; a later column of the same variable must
+        // agree. `vals` stays in schema order, tiny (a factor has a handful of columns).
+        let mut vals: Vec<(usize, &[u8])> = Vec::with_capacity(self.var_cols.len());
+        for (ci, v) in &self.var_cols {
+            match vals.iter().find(|(bv, _)| bv == v) {
+                Some((_, prev)) if *prev != cols[*ci] => return,
+                Some(_) => {}
+                None => vals.push((*v, cols[*ci])),
+            }
+        }
+        self.seen += 1;
+        if self.seen > FD_PROBE_ROW_CAP {
+            self.dead = true;
+            self.det_rows.clear();
+            self.full_rows.clear();
+            return;
+        }
+        let val_of = |var: usize| vals.iter().find(|(v, _)| *v == var).unwrap().1;
+        let (dependent, determinant) = self.schema.split_last().unwrap();
+        let mut det_key = Vec::new();
+        for v in determinant {
+            det_key.extend_from_slice(val_of(*v));
+            det_key.push(0xFF);
+        }
+        let mut full_key = det_key.clone();
+        full_key.extend_from_slice(val_of(*dependent));
+        self.det_rows.insert(det_key);
+        self.full_rows.insert(full_key);
+        // A determinant seen again with a new dependent disproves the FD for good.
+        if self.full_rows.len() > self.det_rows.len() {
+            self.dead = true;
+            self.det_rows.clear();
+            self.full_rows.clear();
+        }
+    }
+
+    /// The trailing FD `(determinant -> dependent)` this factor's data supports, if any.
+    fn resolve(&self) -> Option<(std::collections::BTreeSet<usize>, usize)> {
+        if self.dead || self.seen == 0 {
+            return None;
+        }
+        debug_assert_eq!(self.det_rows.len(), self.full_rows.len());
+        let (dependent, determinant) = self.schema.split_last().unwrap();
+        Some((determinant.iter().copied().collect(), *dependent))
+    }
+}
+
+/// Whether the body is acyclic once functional dependencies are folded in. Detect each factor's
+/// trailing FD from the data, extend every atom that holds a determinant with its dependent to a
+/// fixpoint, and re-run GYO on the extended hyperedges. A body all of whose cycles are carried by
+/// functional relations reduces to acyclic here; a genuine relational cycle does not.
+///
+/// The detection walks each distinct factor prefix once and folds every fact into all factors
+/// sharing that prefix, so a body whose factors are the same arity (a functional pipeline over
+/// one arity, like `finite_domain`) pays a single scan, not one per factor.
+fn body_is_acyclic_modulo_fds(map: &PathMap<()>, factors: &[Factor], nvars: usize) -> bool {
+    use std::collections::BTreeSet;
+
+    // Only simple factors with two or more variables carry a decidable trailing FD; the rest never
+    // contribute one, so they are skipped in the scan and stay plain hyperedges.
+    let mut states: Vec<Option<FactorFd>> = factors
+        .iter()
+        .map(|f| {
+            factor_simple_var_schema(f)
+                .filter(|s| s.len() >= 2)
+                .map(|schema| FactorFd::new(f, schema))
+        })
+        .collect();
+
+    if states.iter().all(|s| s.is_none()) {
+        return false;
+    }
+
+    // Group probeable factors by prefix, walk each prefix's facts once, fold into every factor
+    // that shares it.
+    let mut prefixes: Vec<Vec<u8>> = Vec::new();
+    for (i, st) in states.iter().enumerate() {
+        if st.is_some() && !prefixes.contains(&factors[i].prefix) {
+            prefixes.push(factors[i].prefix.clone());
+        }
+    }
+    for prefix in &prefixes {
+        let members: Vec<usize> = (0..factors.len())
+            .filter(|&i| states[i].is_some() && &factors[i].prefix == prefix)
+            .collect();
+        // One prefix means one arity byte, so every member parses the same column count.
+        let ncols = factors[members[0]].cols.len();
+        debug_assert!(members.iter().all(|&i| factors[i].cols.len() == ncols));
+        let mut rz = map.read_zipper_at_path(prefix);
+        while rz.to_next_val() {
+            let full = rz.origin_path();
+            let cols = split_columns(&full[prefix.len()..], ncols);
+            let mut live = false;
+            for &i in &members {
+                let st = states[i].as_mut().unwrap();
+                st.observe(&cols);
+                live |= !st.dead;
+            }
+            // Every member disproved: a genuinely relational prefix stops paying within its
+            // first collisions instead of walking the whole relation.
+            if !live {
+                break;
+            }
+        }
+    }
+
+    let fds: Vec<(BTreeSet<usize>, usize)> = states
+        .iter()
+        .filter_map(|s| s.as_ref().and_then(FactorFd::resolve))
+        .collect();
+    if fds.is_empty() {
+        return false;
+    }
+
+    let mut edges: Vec<BTreeSet<usize>> = factors
+        .iter()
+        .map(|f| {
+            let mut s = BTreeSet::new();
+            collect_factor_vars(f, &mut s);
+            s
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for (determinant, dependent) in &fds {
+            for e in edges.iter_mut() {
+                if determinant.is_subset(e) && e.insert(*dependent) {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let edges: Vec<BTreeSet<usize>> = edges.into_iter().filter(|s| !s.is_empty()).collect();
+    !hypergraph_is_cyclic(edges, nvars)
+}
+
+/// Whether the body's join hypergraph is cyclic, by GYO reduction (Graham; Yu and Ozsoyoglu). The
+/// hyperedges are the factor variable sets. Runs in the query's size, which is tiny, and touches
+/// no data.
+fn body_is_cyclic(factors: &[Factor], nvars: usize) -> bool {
+    let edges: Vec<std::collections::BTreeSet<usize>> = factors
+        .iter()
+        .map(|f| {
+            let mut s = std::collections::BTreeSet::new();
+            collect_factor_vars(f, &mut s);
+            s
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    hypergraph_is_cyclic(edges, nvars)
+}
+
+/// GYO reduction on an explicit hyperedge list. Repeatedly drop every vertex that lies in only one
+/// edge (an "ear" attachment), then remove any edge contained in another; a query is alpha-acyclic
+/// exactly when this peels the hypergraph down to a single edge or nothing. Whatever cannot be
+/// peeled is a cycle.
+fn hypergraph_is_cyclic(mut edges: Vec<std::collections::BTreeSet<usize>>, nvars: usize) -> bool {
+    loop {
+        let mut changed = false;
+
+        // Drop vertices that occur in exactly one edge: they can never close a cycle.
+        let mut occ = vec![0usize; nvars];
+        for e in &edges {
+            for &v in e {
+                occ[v] += 1;
+            }
+        }
+        for e in &mut edges {
+            let before = e.len();
+            e.retain(|&v| occ[v] > 1);
+            if e.len() != before {
+                changed = true;
+            }
+        }
+
+        // Remove an edge contained in (or equal to) another edge; an empty edge is contained in any.
+        let mut removed = None;
+        'outer: for i in 0..edges.len() {
+            for j in 0..edges.len() {
+                if i != j && edges[i].is_subset(&edges[j]) {
+                    // On equal sets remove only the later one, so two equal edges collapse to one.
+                    if edges[i] == edges[j] && i > j {
+                        continue;
+                    }
+                    removed = Some(i);
+                    break 'outer;
+                }
+            }
+        }
+        if let Some(i) = removed {
+            edges.remove(i);
+            changed = true;
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    edges.len() > 1
 }
 
 struct UnifyJoin<'a> {
@@ -3265,6 +3707,74 @@ mod tests {
             assert_eq!(p0, p1, "trial {i}: performed step counts differ on\n{prog}");
             assert_eq!(s0, s1, "trial {i}: spaces differ on\n{prog}");
         }
+    }
+
+    /// The dispatch policy is cyclicity modulo functional dependencies, refined by the instance:
+    /// tiny queries decline, deep cyclic bodies dispatch, shallow ones dispatch only on a sampled
+    /// heavy hitter, and functionally determined bodies decline after the data probe. Correctness
+    /// never depends on this routing, but the boundary is the performance contract, so pin every
+    /// clause.
+    #[test]
+    fn dispatch_policy_follows_cyclicity_modulo_fds() {
+        // A hub graph (the skewed instance), a branching uniform graph (non-functional, low
+        // degree), and four functional 12x12 tables for the FD diamond.
+        let mut text = String::new();
+        for k in 0..64 {
+            text.push_str(&format!("(hub h o{k})\n(hub i{k} h)\n"));
+        }
+        for k in 0..128 {
+            text.push_str(&format!("(uni n{k} n{})\n(uni n{k} m{k})\n", (k + 1) % 128));
+        }
+        for x in 0..12 {
+            for y in 0..12 {
+                text.push_str(&format!(
+                    "(fa {x} {y} = r{})\n(fb {x} {y} = r{})\n",
+                    (x + y) % 12,
+                    (x * y) % 12
+                ));
+                text.push_str(&format!(
+                    "(fc r{x} r{y} = s{})\n(fd r{x} r{y} = s{})\n",
+                    (x + y) % 12,
+                    (x + 2 * y) % 12
+                ));
+            }
+        }
+        text.push_str("(e a b)\n(e a c)\n(e b c)\n");
+        let mut s = crate::space::Space::new();
+        s.add_all_sexpr(text.as_bytes()).unwrap();
+        let case = |body: &str| -> bool {
+            let b = enc(body);
+            let (factors, nvars) = parse_body_factors(&b).unwrap();
+            body_factors_profit_from_leapfrog(&s.btm, &factors, nvars)
+        };
+        assert!(
+            case("(, (hub $x $y) (hub $y $z) (hub $x $z))"),
+            "a triangle through a sampled heavy hitter must dispatch"
+        );
+        assert!(
+            !case("(, (uni $x $y) (uni $y $z) (uni $x $z))"),
+            "a uniform triangle has no heavy hitter and must decline"
+        );
+        assert!(
+            case("(, (uni $a $b) (uni $b $c) (uni $c $d) (uni $d $a))"),
+            "a deep cyclic body dispatches on product depth alone"
+        );
+        assert!(
+            !case("(, (fa $x $y = $u) (fb $x $y = $v) (fc $u $v = $w) (fd $u $v = $z))"),
+            "a functional diamond is FD-acyclic and must decline"
+        );
+        assert!(
+            !case("(, (e $x $y) (e $y $z) (e $x $z))"),
+            "a tiny query declines whatever its shape"
+        );
+        assert!(
+            !case("(, (uni $x $y) (uni $y $z))"),
+            "an acyclic path must decline on GYO alone"
+        );
+        assert!(
+            !case("(, (p $x (q $y)) (r $y (s $z)) (t $z (u $x)))"),
+            "a cycle carried only inside compounds has nothing the leapfrog can seek"
+        );
     }
 
     /// Bodies the router does not own (a bare-variable factor, the empty conjunction) must fall
